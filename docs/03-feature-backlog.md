@@ -31,6 +31,7 @@
 - [ ] Serial-path host daemon (zero-mod wired input injection)
 - [ ] Custom Himax gesture models (pointing vector) via SenseCraft
 - [ ] microSD macro library, OTA
+- [ ] **S3-orchestrated Himax firmware switching** (John, 2026-09-29): S3 reflashes the Himax between TFLM (inference) and capture-only (high-res) firmware on demand during a single uptime. No USB cable, no manual flash. Needs: bootloader trigger via GPIO/command, UART transport path S3→Himax for XMODEM, both images in S3 flash partitions. Timing TBD — not scheduled.
 
 ## Explicitly out of scope (for now)
 - Native USB HID through the stock USB-C port — hardware-blocked (bridge only).
