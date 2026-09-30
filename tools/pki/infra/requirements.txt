@@ -1,0 +1,5 @@
+# CDK app dependencies (pinned: reproducible synth/deploy).
+aws-cdk-lib==2.271.0
+constructs==10.8.1
+# Test dependency: Tier 0 / Tier 1 cert signing and verification.
+pynacl==1.6.2

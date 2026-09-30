@@ -1,0 +1,20 @@
+# Function names allowed to call flash-write APIs directly despite the
+# PSRAM/flash audit. One per line; "#" starts a comment.
+#
+# ONLY the dedicated NVS task belongs here. It runs on an internal-RAM
+# stack via xTaskCreateStatic() with a DRAM_ATTR static buffer (v0.4.8;
+# bare xTaskCreate is UNSAFE with SPIRAM_USE_MALLOC — the v0.4.7 boot
+# panic) and is the single task permitted to touch NVS/flash — for
+# reads AND writes (v0.4.7: the task is reader/writer agnostic). Every
+# other task — especially PSRAM-stack tasks — must go through the
+# synchronous seal_dev_nvs_*_sync() APIs, which block until the nvs
+# task completes the operation.
+#
+# v0.4.7 contract: single FIFO queue, strictly ordered; callers block;
+# never drop/never reject (queue-full or broker-hung = panic); only
+# NVS hardware errors propagate to callers.
+#
+# v0.4.8: entry is the TASK FUNCTION name (nvs_task_fn), matched against
+# definitions and xTaskCreateStatic() creation sites by
+# audit_psram_flash.py.
+nvs_task_fn

@@ -1,0 +1,7 @@
+{
+ "name": "cross-topic",
+ "b64": "V01TMgIAbXVzZS0wMQAAAAAAAAAAAAEAAAAAAAAAgCShg5kBAAAAAHsiaWQiOiAidDEiLCAiY21kIjogeyJ0IjogImRiZyIsICJjbWQiOiAidmVyc2lvbiJ9fZuVDqmFLE0Uv1PVxPXQX7qGiG3aM0LRZaajBrJSbI87Ke0hKeQqr6E23Yd7nTEjoglRmSyS7BGHsokQH9m3CAE=",
+ "topic": "watcher/telemetry",
+ "want": "BAD_SIG",
+ "want_log": "SEAL: BAD SIGNATURE from muse-01 on 'watcher/telemetry' - DROPPED"
+}

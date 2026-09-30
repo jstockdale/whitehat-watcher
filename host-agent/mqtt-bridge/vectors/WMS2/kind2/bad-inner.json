@@ -1,0 +1,7 @@
+{
+ "name": "bad-inner",
+ "b64": "V01TMgIAbXVzZS0wMQAAAAAAAAAAAAEAAAAAAAAAgCShg5kBAAAAAHRoaXMgaXMgbm90IGpzb27HP5X0UNdist5ZP/SAaIK17/pFLEv5lLds3St/gErTdSAOvHqBCPMc1rBbMeTMPYzXd2PIbhvMkTLVQmBBsHwM",
+ "topic": "watcher/command",
+ "want": "BAD_INNER",
+ "want_log": "SEAL: verified envelope, bad inner JSON - DROPPED"
+}

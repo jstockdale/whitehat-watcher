@@ -1,0 +1,4 @@
+dependencies:
+  idf: ">=5.0.0"
+  espressif/esp_lcd_touch_spd2010:
+    version: "0.0.1"

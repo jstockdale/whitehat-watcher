@@ -1,0 +1,9 @@
+{
+ "b64": "V01TMgEBcGFnZS0wMQAAAAAAAAAAAAEAAAAAAAAAgCShg5kBAAAAAAABAgMEBQYHCAkKCwwNDg8QERITFBUWFwWyyxabeLzXykIqeLBIbHlIycsaXAZ+zVlwfK5JwSh25Dsvu6EVh9ArFAi57xzu9m5AkFdGifeFg6oH0lQNrWaoYWdyGx9UFrYpP3Sr9b/ly0WeKKAQIE0UdR9ev7V0u+ntbUhFeWJGdg99aYvIqueQ5urUHJ8HA68sNtlY6rTCK1GINDmZ",
+ "body": "{\"t\":\"snaptest_chunk\",\"id\":7,\"seq\":3,\"total\":40,\"b64\":\"aGVsbG8td29ybGQtZnJhbWUtZGF0YQ==\",\"last\":false}",
+ "name": "ct-tamper",
+ "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+ "topic": "watcher/telemetry",
+ "want": "BAD_TAG",
+ "want_log": "SEAL: BAD TAG from page-01 on 'watcher/telemetry' - DROPPED"
+}

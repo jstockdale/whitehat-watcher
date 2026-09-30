@@ -1,0 +1,7 @@
+{
+ "name": "kind",
+ "b64": "V01TMgMAbXVzZS0wMQAAAAAAAAAAAAEAAAAAAAAAgCShg5kBAAAAAHsiaWQiOiAidDEiLCAiY21kIjogeyJ0IjogImRiZyIsICJjbWQiOiAidmVyc2lvbiJ9fZuVDqmFLE0Uv1PVxPXQX7qGiG3aM0LRZaajBrJSbI87Ke0hKeQqr6E23Yd7nTEjoglRmSyS7BGHsokQH9m3CAE=",
+ "topic": "watcher/command",
+ "want": "KIND",
+ "want_log": "SEAL: bad kind 3 on 'watcher/command' - DROPPED"
+}

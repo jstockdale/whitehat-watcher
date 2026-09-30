@@ -1,0 +1,88 @@
+# Mosquitto ACL — mqtt.offx1.com (authoritative, 2026-09-27)
+# 2026-09-27: applied audit 4a (heartbeat write grants for watcher) +
+# 4b/4c (keepalive/jiggle directional splits for console 0.4.86).
+# Drop-in replacement for the 2026-09-25 file. After applying on the
+# broker, re-mirror: copy this file over mosquitto-acl-20260925.acl
+# (or re-paste from the broker) so the local mirror matches.
+
+# ============ muse user (bridge subscriber + Muse agent) ============
+user muse
+# Bridge reads page telemetry, status, audio
+topic read watcher/telemetry
+topic read watcher/status
+topic read watcher/audio
+# Bridge publishes status here; also receives console pings
+topic readwrite watcher/bridge
+# Muse agent sends device commands (bridge does not need to read these)
+topic write watcher/command
+# Keepalive: page publishes config on watcher/keepalive (single writer);
+# bridge publishes its own takeover claims on watcher/keepalive_bridge
+# (single writer). Daemon subscribes to both; page config wins ties.
+topic read watcher/keepalive
+topic write watcher/keepalive_bridge
+# Jiggler: page publishes pill state on watcher/jiggle (single writer);
+# bridge remote-control publishes on watcher/jiggle_bridge (single
+# writer). Page applies bridge messages to its jiggler.
+topic read watcher/jiggle
+topic write watcher/jiggle_bridge
+# Muse driving state: agent publishes, bridge monitors
+topic readwrite watcher/muse
+# Pause state: bidirectional (page publishes pill clicks, agent publishes remote pause)
+topic readwrite watcher/muse_pause
+# Command queue: bidirectional (page publishes depth, agent can clear)
+topic readwrite watcher/muse_queue
+# Heartbeats: bridge listens (added 2026-09-25; no consumer in subscriber.py yet)
+topic read watcher/heartbeat
+topic read watcher/console_heartbeat
+
+# ============ watcher user (console page) ============
+user watcher
+# Page publishes telemetry and status to the bridge
+topic write watcher/telemetry
+topic write watcher/status
+# Heartbeats: page publishes device + console heartbeats (audit 4a, 2026-09-27)
+topic write watcher/heartbeat
+topic write watcher/console_heartbeat
+# Bridge status and ping: page receives status, sends pings
+topic readwrite watcher/bridge
+# Device commands: page receives from agent only
+topic read watcher/command
+# Keepalive and jiggler: page publishes config, receives remote state
+topic readwrite watcher/keepalive
+topic readwrite watcher/jiggle
+# Bridge keepalive/jiggle: page reads the bridge's takeover claims and
+# remote-drive messages (audit 4b/4c, 2026-09-27)
+topic read watcher/keepalive_bridge
+topic read watcher/jiggle_bridge
+# Muse driving state: page receives only
+topic read watcher/muse
+# Pause state: bidirectional
+topic readwrite watcher/muse_pause
+# Command queue: bidirectional
+topic readwrite watcher/muse_queue
+
+# ---- Auditor notes (Muse) ----
+# 1. RESOLVED 2026-09-27 (audit 4a): watcher/heartbeat and
+#    watcher/console_heartbeat now have `topic write` for the watcher
+#    user. Previously silently dropped by the broker (default-deny).
+# 2. No user has write on watcher/audio (muse: read; watcher: none).
+#    The page currently batches audio chunks into watcher/telemetry
+#    instead; watcher/audio is aspirational ("preferred once the
+#    console routes t:audio here" per subscriber.py).
+# 3. muse has read-only on watcher/jiggle and watcher/keepalive, plus
+#    write on the new watcher/jiggle_bridge + watcher/keepalive_bridge
+#    (single-writer splits, audit 4b/4c). Direct bridge writes to the
+#    page-owned topics stay forbidden.
+# 4. 2026-09-26: an ACL-vs-topics checker guards every publish
+#    (topic_acl.py + audit_topics.py). Runtime: all bridge publish paths
+#    go through publish_checked() — ungranted topics are BLOCKED locally
+#    with a loud ACL-DENY banner. Static: audit_topics.py checks every
+#    bridge publish site (AST) + every page mqttPublish site (parsed
+#    from watcher-console.html). Run the static audit before shipping
+#    any bridge/console patch and after any broker ACL change
+#    (re-mirror this file first).
+# 5. 2026-09-27: after applying this file on the broker, tell Muse so
+#    the local mirror (mosquitto-acl-20260925.acl) can be updated and
+#    the static audit re-run. Until then the audit correctly reports
+#    the new bridge topics as DENY and bridge publishes there stay
+#    blocked loudly.

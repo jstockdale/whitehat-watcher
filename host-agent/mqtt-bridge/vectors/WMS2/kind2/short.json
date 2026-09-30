@@ -1,0 +1,7 @@
+{
+ "name": "short",
+ "b64": "AAAAAAAAAAAAAA==",
+ "topic": "watcher/command",
+ "want": "SHORT",
+ "want_log": "SEAL: SHORT msg on 'watcher/command' - DROPPED"
+}

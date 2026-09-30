@@ -1,0 +1,95 @@
+<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Watcher Firmware v0.4.6 — Build Report</title>
+<style>
+body{margin:20px;background:#0a0a0a;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:1100px;margin:0 auto;padding:24px;line-height:1.6}
+h1{color:#fff;font-size:28px;margin-bottom:4px}
+h2{color:#4fc3f7;font-size:20px;margin-top:32px;border-bottom:1px solid #333;padding-bottom:8px}
+h3{color:#81c784;font-size:16px;margin-top:20px}
+.subtitle{color:#888;font-size:14px;margin-bottom:24px}
+.grid{display:flex;gap:16px;flex-wrap:wrap;margin:16px 0}
+.card{background:#1a1a1a;padding:16px;border-radius:8px;flex:1;min-width:280px;margin:8px 0;border:1px solid #2a2a2a}
+.metric{background:#111;padding:14px;margin:8px 0;border-radius:4px;font-family:"SF Mono",Menlo,monospace;font-size:13px;line-height:1.7;overflow-x:auto;border:1px solid #222}
+.success{color:#81c784;font-weight:bold}
+.error{color:#ff8a65;font-weight:bold}
+.warn{color:#ffb74d;font-weight:bold}
+.info{color:#4fc3f7;font-weight:bold}
+table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px}
+th,td{border:1px solid #333;padding:10px 12px;text-align:left}
+th{background:#1f1f1f;color:#4fc3f7;font-weight:600}
+tr:nth-child(even){background:#141414}
+.notes{background:#2a2300;border-left:3px solid #ffc107;padding:12px 16px;margin:12px 0;font-size:14px;border-radius:0 4px 4px 0}
+code{background:#222;padding:2px 6px;border-radius:3px;font-family:"SF Mono",Menlo,monospace;font-size:13px}
+.badge{display:inline-block;padding:4px 12px;border-radius:12px;font-size:12px;font-weight:bold;margin-right:8px}
+.badge-pass{background:#1b3a1b;color:#81c784;border:1px solid #2d5a2d}
+.badge-fail{background:#3a1b1b;color:#ff8a65;border:1px solid #5a2d2d}
+.badge-info{background:#1b2a3a;color:#4fc3f7;border:1px solid #2d4a5a}
+ul{margin:8px 0;padding-left:24px}
+li{margin:6px 0}
+.footer{margin-top:40px;padding-top:16px;border-top:1px solid #333;color:#666;font-size:12px;text-align:center}
+</style></head><body>
+<h1>Watcher Firmware v0.4.6 — Build Report</h1>
+<div class='subtitle'>Build date: 2026-09-27
+<br>SHA-256: <code>d83e982f722b88ee59e56201ffa1638300e34d98d6bf009e3a6fab3f120bacc9</code>
+</div>
+<h2>Pipeline Stages</h2>
+<table><tr><th>Stage</th><th>Status</th><th>Duration</th><th>Output</th></tr>
+<tr><td>Clean build (idf.py build)</td><td><span class="badge badge-pass">PASS</span></td><td>~6m 19s</td><td>0 errors, 0 warnings
+<br><span style='color:#888'>ESP-IDF 5.3, ESP32-S3. Fixed 3 build breaks: task_psram REQUIRES, wakeword brace, S3 RWDT HAL (rtc_wdt_feed is ESP32/S2-only).</span>
+</td></tr>
+<tr><td>PSRAM/flash audit</td><td><span class="badge badge-pass">PASS</span></td><td><1s</td><td>clean — 11 PSRAM-stack tasks, call graphs checked, 1 allowlisted
+<br><span style='color:#888'>tools/audit_psram_flash.py</span>
+</td></tr>
+<tr><td>WMS2 seal tests</td><td><span class="badge badge-pass">PASS</span></td><td>~3s</td><td>74/74
+<br><span style='color:#888'>Host gcc build, pure C99. Unchanged from 0.4.5.</span>
+</td></tr>
+<tr><td>WIA1 session tests</td><td><span class="badge badge-pass">PASS</span></td><td>n/a (code unchanged)</td><td>196/196 (0.4.5 result, wia1.c untouched)
+<br><span style='color:#888'>Host test requires ESP-IDF stubs; wia1.c not modified in 0.4.6.</span>
+</td></tr>
+<tr><td>merge-bin</td><td><span class="badge badge-pass">PASS</span></td><td>~12s</td><td>release/watcher-v0.4.6-merged.bin, 7,762,246 bytes
+<br><span style='color:#888'>idf.py merge-bin (auto offset 0x20000 for factory)</span>
+</td></tr>
+<tr><td>Binary verification</td><td><span class="badge badge-pass">PASS</span></td><td><1s</td><td>magics e9@0x0, aa50@0x8000, e9@0x20000; partition table byte-identical to 0.4.5
+</td></tr>
+</table>
+<h2>Changes</h2>
+<div class='card'><h3>WDT: active watchdog with HAL feeding (S3 RWDT)</h3>
+<div class='metric'><span class='error'>BEFORE:</span> CONFIG_BOOTLOADER_WDT_DISABLE_IN_USER_CODE was removed (wrong). ESP-IDF startup then DISABLED the RTC WDT via init_disable_rtc_wdt — the opposite of John's goal. rtc_wdt_feed() doesn't exist on S3.<br>
+<span class='success'>AFTER:</span> CONFIG_BOOTLOADER_WDT_DISABLE_IN_USER_CODE=y (keeps bootloader RWDT armed). main.c feeds the S3 RWDT via wdt_hal_feed() every 1s in the supervisor loop. Task WDT 5s + panic, INT WDT 300ms unchanged.</div>
+<div class='notes'>If the main loop hangs, the RTC WDT WILL fire (reset reason 7) — the safety net works instead of being silently disabled.</div>
+</div>
+<div class='card'><h3>RAM: 8 tasks moved to PSRAM stacks</h3>
+<div class='metric'><span class='error'>BEFORE:</span> 8 tasks (snap, snaptest, hid_keepalive, input, input_retry, link_rx, mqtt_native, ww_feed) used internal DRAM stacks.<br>
+<span class='success'>AFTER:</span> All 8 now use task_psram_create() with stacks in PSRAM. nvs_writer stays internal (NVS constraint). task_psram tracks handles; transient tasks (snap/snaptest/input_retry/ww_feed) use deferred cleanup.</div>
+<div class='notes'>Frees internal DRAM for DMA/camera/seal buffers. Stack sizes in bytes (ESP-IDF convention); audit's 'words' claim was corrected.</div>
+</div>
+<div class='card'><h3>RAM: transient heap buffers to PSRAM</h3>
+<div class='metric'><span class='error'>BEFORE:</span> eyes snap/snaptest jobs, link JSON/command buffers, ptt base64, mqtt_native MQTT/JSON buffers used internal heap.<br>
+<span class='success'>AFTER:</span> All moved to heap_caps_malloc(MALLOC_CAP_SPIRAM). wms2.c scratch left as-is (must stay pure C99 for host tests).</div>
+<div class='notes'>Reduces internal heap pressure during seal/MQTT/camera operations.</div>
+</div>
+<h2>Binary Verification</h2>
+<div class='grid'>
+<div class='card'><h3>Size</h3><div class='metric'>7,762,246 bytes</div></div>
+<div class='card'><h3>SHA-256</h3><div class='metric' style='word-break:break-all'>d83e982f722b88ee59e56201ffa1638300e34d98d6bf009e3a6fab3f120bacc9</div></div>
+</div>
+<h3>Magic Bytes</h3><table>
+<tr><th>Offset</th><th>Value</th><th>Expected</th><th>Status</th></tr>
+<tr><td><code>0x0</code></td><td><code>e9</code></td><td><code>e9</code></td><td><span class="badge badge-pass">PASS</span></td></tr>
+<tr><td><code>0x8000</code></td><td><code>aa50</code></td><td><code>aa50</code></td><td><span class="badge badge-pass">PASS</span></td></tr>
+<tr><td><code>0x20000</code></td><td><code>e9</code></td><td><code>e9</code></td><td><span class="badge badge-pass">PASS</span></td></tr>
+</table>
+<div class='metric'>Partition table: <span class='success'>byte-identical</span>
+ (vs v0.4.5)
+</div>
+<h2>Known Issues</h2><ul>
+<li>10-second WDT reboot loop (0.4.5): device reports ESP_RST_WDT (reason 7), ROM reports RTCWDT_RTC_RST. 0.4.6 keeps the WDT active AND feeds it — if the loop was a hung task, the feed fixes it; if it was a real hang, we'll now get a proper WDT panic trace instead of silence.</li>
+<li>RAM savings are compile-time estimates. True before/after internal heap measurements require device telemetry (heap_caps_get_free_size) — pending flash and test.</li>
+</ul>
+<h2>Next Steps</h2><ul>
+<li>Flash v0.4.6 (requires John's explicit approval — DO NOT flash without it).</li>
+<li>Verify the 10s WDT loop is resolved; check reset reason via telemetry.</li>
+<li>Capture heap_caps free/largest before/after for the RAM audit correction.</li>
+<li>If WDT still fires, the panic trace will identify the hung task.</li>
+</ul>
+<div class='footer'>Generated 2026-09-27 09:37  &bull; Watcher Firmware Build System</div>
+</body></html>

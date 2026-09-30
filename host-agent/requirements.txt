@@ -1,0 +1,9 @@
+# Phase 0 host agent dependencies (Python 3.10+)
+pyserial>=3.5              # USB-serial JSON link to the Watcher
+pynput>=1.7                # host-side input injection (fallback path + click_at)
+opencv-python-headless>=4.8  # screen detection / perspective warp (no GUI needed)
+numpy>=1.24                # array math for vision
+
+# NOTE: bleak is intentionally NOT required in Phase 0. BLE HID is handled by
+# the host OS Bluetooth stack (pair the Watcher like any Bluetooth keyboard);
+# the agent never opens a BLE connection itself.

@@ -1,0 +1,80 @@
+<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Watcher Firmware 0.4.8 — nvs_task PSRAM Stack Fix</title>
+<style>
+body{margin:20px;background:#0a0a0a;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:1100px;margin:0 auto;padding:24px;line-height:1.6}
+h1{color:#fff;font-size:28px;margin-bottom:4px}
+h2{color:#4fc3f7;font-size:20px;margin-top:32px;border-bottom:1px solid #333;padding-bottom:8px}
+h3{color:#81c784;font-size:16px;margin-top:20px}
+.subtitle{color:#888;font-size:14px;margin-bottom:24px}
+.grid{display:flex;gap:16px;flex-wrap:wrap;margin:16px 0}
+.card{background:#1a1a1a;padding:16px;border-radius:8px;flex:1;min-width:280px;margin:8px 0;border:1px solid #2a2a2a}
+.metric{background:#111;padding:14px;margin:8px 0;border-radius:4px;font-family:"SF Mono",Menlo,monospace;font-size:13px;line-height:1.7;overflow-x:auto;border:1px solid #222}
+.success{color:#81c784;font-weight:bold}
+.error{color:#ff8a65;font-weight:bold}
+.warn{color:#ffb74d;font-weight:bold}
+.info{color:#4fc3f7;font-weight:bold}
+table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px}
+th,td{border:1px solid #333;padding:10px 12px;text-align:left}
+th{background:#1f1f1f;color:#4fc3f7;font-weight:600}
+tr:nth-child(even){background:#141414}
+.notes{background:#2a2300;border-left:3px solid #ffc107;padding:12px 16px;margin:12px 0;font-size:14px;border-radius:0 4px 4px 0}
+code{background:#222;padding:2px 6px;border-radius:3px;font-family:"SF Mono",Menlo,monospace;font-size:13px}
+.badge{display:inline-block;padding:4px 12px;border-radius:12px;font-size:12px;font-weight:bold;margin-right:8px}
+.badge-pass{background:#1b3a1b;color:#81c784;border:1px solid #2d5a2d}
+.badge-fail{background:#3a1b1b;color:#ff8a65;border:1px solid #5a2d2d}
+.badge-info{background:#1b2a3a;color:#4fc3f7;border:1px solid #2d4a5a}
+ul{margin:8px 0;padding-left:24px}
+li{margin:6px 0}
+.footer{margin-top:40px;padding-top:16px;border-top:1px solid #333;color:#666;font-size:12px;text-align:center}
+</style></head><body>
+<h1>Watcher Firmware 0.4.8 — nvs_task PSRAM Stack Fix</h1>
+<div class='subtitle'>Build date: 2026-09-27
+<br>SHA-256: <code>9433cdb96b37cf728e30892a23ee4ce2b05acb2b46070eda95189ece31de0bde</code>
+</div>
+<h2>Pipeline Stages</h2>
+<table><tr><th>Stage</th><th>Status</th><th>Duration</th><th>Output</th></tr>
+<tr><td>Clean build (ESP-IDF 5.3)</td><td><span class="badge badge-pass">PASS</span></td><td>~35s</td><td>0 errors, 0 warnings (warnings-as-errors)
+</td></tr>
+<tr><td>audit_psram_flash.py (hardened)</td><td><span class="badge badge-pass">PASS</span></td><td><1s</td><td>12 PSRAM-stack tasks, call graphs checked, 1 allowlisted; new xTaskCreateStatic+DRAM_ATTR stack check passes
+</td></tr>
+<tr><td>WMS2 seal envelope suite</td><td><span class="badge badge-pass">PASS</span></td><td>~3s</td><td>74/74
+</td></tr>
+<tr><td>WIA1 session/auth suite</td><td><span class="badge badge-pass">PASS</span></td><td>~3s</td><td>196/196
+</td></tr>
+<tr><td>idf.py merge-bin</td><td><span class="badge badge-pass">PASS</span></td><td>~9s</td><td>release/watcher-v0.4.8-merged.bin
+</td></tr>
+<tr><td>Binary verification</td><td><span class="badge badge-pass">PASS</span></td><td><1s</td><td>magics e9@0x0, aa50@0x8000, e9@0x20000; partition table byte-identical to 0.4.7
+</td></tr>
+</table>
+<h2>Changes</h2>
+<div class='card'><h3>nvs_task stack: xTaskCreate -> xTaskCreateStatic + DRAM_ATTR</h3>
+<div class='metric'><span class='error'>BEFORE:</span> Bare xTaskCreate(nvs_task_fn, ..., 4096, ...) allocated the 16384-byte stack via pvPortMalloc(MALLOC_CAP_DEFAULT). With SPIRAM_USE_MALLOC=y + ALWAYSINTERNAL=16384, 16384 is NOT < 16384, so the allocator placed the stack in PSRAM. First NVS->flash->cache-disable panicked (esp_task_stack_is_sane_cache_disabled) — the v0.4.7 boot loop.<br>
+<span class='success'>AFTER:</span> Static DRAM_ATTR StackType_t nvs_task_stack_[4096] + StaticTask_t TCB, created via xTaskCreateStatic(). Linker-guaranteed in internal DRAM (verified: 0x3fcaa958 in 0x3FC8xxxx DRAM region). Boot-time assert(esp_ptr_internal(&probe)) fails fast on any regression.</div>
+</div>
+<div class='card'><h3>audit_psram_flash.py: flash-task stack placement check</h3>
+<div class='metric'><span class='error'>BEFORE:</span> Allowlist entry 'nvs_task' was dead (function is nvs_task_fn); no check that flash-touching tasks run on internal stacks. The xTaskCreate allocator threshold hazard was invisible to the audit.<br>
+<span class='success'>AFTER:</span> Allowlist fixed to nvs_task_fn. New check_flash_task_stacks(): every allowlisted function must be created via xTaskCreateStatic() with a DRAM_ATTR static stack — bare xTaskCreate is a build failure. Negative-tested against the v0.4.7 code (correctly flags it).</div>
+</div>
+<h2>Binary Verification</h2>
+<div class='grid'>
+<div class='card'><h3>Size</h3><div class='metric'>7,762,246 bytes</div></div>
+<div class='card'><h3>SHA-256</h3><div class='metric' style='word-break:break-all'>9433cdb96b37cf728e30892a23ee4ce2b05acb2b46070eda95189ece31de0bde</div></div>
+</div>
+<h3>Magic Bytes</h3><table>
+<tr><th>Offset</th><th>Value</th><th>Expected</th><th>Status</th></tr>
+<tr><td><code>0x0</code></td><td><code>e9</code></td><td><code>e9</code></td><td><span class="badge badge-pass">PASS</span></td></tr>
+<tr><td><code>0x8000</code></td><td><code>aa50</code></td><td><code>aa50</code></td><td><span class="badge badge-pass">PASS</span></td></tr>
+<tr><td><code>0x20000</code></td><td><code>e9</code></td><td><code>e9</code></td><td><span class="badge badge-pass">PASS</span></td></tr>
+</table>
+<div class='metric'>Partition table: <span class='success'>byte-identical</span>
+ (vs 0.4.7)
+</div>
+<h2>Known Issues</h2><ul>
+<li>None new. The v0.4.7 boot panic (nvs_task on PSRAM stack) is fixed by the static DRAM stack. The v0.4.6 WDT feeding fix (main loop feeds bootloader RWDT) is unchanged.</li>
+</ul>
+<h2>Next Steps</h2><ul>
+<li>Flash 0.4.8 and verify: no boot loop, reset reason 1 (power-on) or 3 (software), nvs_task boot log shows internal-DRAM stack address.</li>
+<li>Run {"t":"dbg","cmd":"nvs_stress"} over serial to verify the nvs_task FIFO ordering/blocking contract.</li>
+</ul>
+<div class='footer'>Generated 2026-09-27 18:53  &bull; Watcher Firmware Build System</div>
+</body></html>

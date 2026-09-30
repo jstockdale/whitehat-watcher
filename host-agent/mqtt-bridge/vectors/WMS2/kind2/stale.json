@@ -1,0 +1,7 @@
+{
+ "name": "stale",
+ "b64": "V01TMgIAbXVzZS0wMQAAAAAAAAAAAAEAAAAAAAAAoJCcg5kBAAAAAHsiaWQiOiAidDEiLCAiY21kIjogeyJ0IjogImRiZyIsICJjbWQiOiAidmVyc2lvbiJ9feyUE3Np9EKEOmQR1bLdh1M6/knfi1uljNvpGzbtmflc4gRD3KyDAzU4WyG+gXRRZrDCoy4+xJtfqTMYsMsSOQs=",
+ "topic": "watcher/command",
+ "want": "STALE",
+ "want_log": "SEAL: STALE ts (|dt|=300001ms) from muse-01 - DROPPED"
+}

@@ -1,0 +1,7 @@
+{
+ "name": "ctr-range",
+ "b64": "V01TMgIAbXVzZS0wMQAAAAAAAAAAAP//////////gCShg5kBAAAAAHsiaWQiOiAidDEiLCAiY21kIjogeyJ0IjogImRiZyIsICJjbWQiOiAidmVyc2lvbiJ9fZuVDqmFLE0Uv1PVxPXQX7qGiG3aM0LRZaajBrJSbI87Ke0hKeQqr6E23Yd7nTEjoglRmSyS7BGHsokQH9m3CAE=",
+ "topic": "watcher/command",
+ "want": "SHORT",
+ "want_log": "SEAL: counter/timestamp out of JS-safe range on 'watcher/command' - DROPPED"
+}

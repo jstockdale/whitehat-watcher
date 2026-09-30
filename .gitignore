@@ -1,0 +1,34 @@
+# Build artifacts
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+**/build/
+**/managed_components/
+
+# Training data (too large for git)
+wakeword-training/
+cursor-model/
+
+# Binary artifacts
+*.bin
+*.img
+*.elf
+*.map
+
+# Captures and logs
+himax-captures/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/

@@ -1,0 +1,9 @@
+{
+ "b64": "V01TMgEBcGFnZS0wMQAAAAAAAAAAAAkAAAAAAAAAgCShg5kBAAAAAAkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCTt/JW4CJJXAnepqVTXjVCat7vQg59bZB+kRy96N6omQn+5B8Q3bZU1Nt9nwLrhpKKfdWNYa68fFKdaZiUnznbC0kmNWguj7WLElgGOvQP8neQiSrDwK0aIb0P64vPeD+TbCtna+0Ifw/tEad58NZL3M0kcgfXj4uKavjQ==",
+ "body": "{\"t\":\"audio\",\"seq\":11,\"b64\":\"UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=\"}",
+ "name": "audio-roundtrip",
+ "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+ "topic": "watcher/telemetry",
+ "want": "OK",
+ "want_log": ""
+}

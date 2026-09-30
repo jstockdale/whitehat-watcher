@@ -1,0 +1,8 @@
+{
+ "name": "replay",
+ "b64_first": "V01TMgIAbXVzZS0wMQAAAAAAAAAAAAIAAAAAAAAAgCShg5kBAAAAAHsiaWQiOiAidDEiLCAiY21kIjogeyJ0IjogImRiZyIsICJjbWQiOiAidmVyc2lvbiJ9fYXxDyyIo+tdzHCPjY6gCvSlQ9nRYaZpMCrWAsnfC+Fhag7kT1j2bvkLnEak9AJbAnNqW/ktHnmd753DZBQecwc=",
+ "b64": "V01TMgIAbXVzZS0wMQAAAAAAAAAAAAEAAAAAAAAAgCShg5kBAAAAAHsiaWQiOiAidDEiLCAiY21kIjogeyJ0IjogImRiZyIsICJjbWQiOiAidmVyc2lvbiJ9fZuVDqmFLE0Uv1PVxPXQX7qGiG3aM0LRZaajBrJSbI87Ke0hKeQqr6E23Yd7nTEjoglRmSyS7BGHsokQH9m3CAE=",
+ "topic": "watcher/command",
+ "want": "REPLAY",
+ "want_log": "SEAL: REPLAY ctr 1 <= 2 from muse-01 - DROPPED"
+}

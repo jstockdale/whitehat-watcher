@@ -1,0 +1,16 @@
+[Unit]
+Description=Watcher MQTT Bridge Subscriber
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/projects/watcher-input-assistant/host-agent/mqtt-bridge
+EnvironmentFile=%h/.config/watcher-mqtt.env
+ExecStart=/usr/bin/python3 subscriber.py
+Restart=always
+RestartSec=10
+StandardOutput=append:%h/workspace/projects/watcher-input-assistant/host-agent/mqtt-bridge/subscriber.log
+StandardError=append:%h/workspace/projects/watcher-input-assistant/host-agent/mqtt-bridge/subscriber.log
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,25 @@
+set(srcs "src/sscma_client_ops.c"
+         "src/sscma_client_io.c"
+         "src/sscma_client_io_i2c.c"
+         "src/sscma_client_io_spi.c"
+         "src/sscma_client_io_uart.c"
+         "src/sscma_client_flasher.c"
+         "src/sscma_client_flasher_we2_uart.c"
+         "src/sscma_client_flasher_we2_spi.c"
+         )
+set(includes "include" "interface")
+if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
+    set(json_component "espressif__cjson")
+    set(driver_components "driver" "esp_driver_gpio" "esp_driver_i2c" "esp_driver_spi" "esp_driver_uart")
+else()
+    set(json_component "json")
+    set(driver_components "driver")
+endif()
+set(require "${json_component}" "mbedtls" "esp_timer")
+set(priv_requires ${driver_components})
+
+idf_component_register(SRCS ${srcs}
+                       INCLUDE_DIRS ${includes}
+                       REQUIRES ${require}
+                       PRIV_REQUIRES ${priv_requires}
+                       )

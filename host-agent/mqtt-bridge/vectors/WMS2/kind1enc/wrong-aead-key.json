@@ -1,0 +1,9 @@
+{
+ "b64": "V01TMgEBcGFnZS0wMQAAAAAAAAAAAAEAAAAAAAAAgCShg5kBAAAAAAABAgMEBQYHCAkKCwwNDg8QERITFBUWF20g7XXTGWliu0+8Mbv9gPmWcxdGiFw6MlVca4e5/zOEfui4gWbRk935q0IS7AoUUJDKdyavBBge3Pr187KeoMwuskgZAI1mptewN2Fj9A4LN3y9iUTdSztrDwdLEzBksuO/VWRlg9p3W0FON4FqLQ4ny7zwY0k9dXv917Mhm8AcyrB3iLKN",
+ "body": "{\"t\":\"snaptest_chunk\",\"id\":7,\"seq\":3,\"total\":40,\"b64\":\"aGVsbG8td29ybGQtZnJhbWUtZGF0YQ==\",\"last\":false}",
+ "name": "wrong-aead-key",
+ "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+ "topic": "watcher/telemetry",
+ "want": "BAD_TAG",
+ "want_log": "SEAL: AEAD FAIL from page-01 on 'watcher/telemetry' - DROPPED"
+}

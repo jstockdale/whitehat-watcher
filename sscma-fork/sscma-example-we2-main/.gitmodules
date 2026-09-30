@@ -1,0 +1,13 @@
+[submodule "EPII_CM55M_APP_S/library/cmsis_cv/CMSIS-CV"]
+	path = EPII_CM55M_APP_S/library/cmsis_cv/CMSIS-CV
+	url = https://github.com/ARM-software/CMSIS-CV.git
+[submodule "EPII_CM55M_APP_S/library/sscma_micro"]
+	path = EPII_CM55M_APP_S/library/sscma_micro
+	url = https://github.com/Seeed-Studio/SSCMA-Micro
+	branch = main
+[submodule "EPII_CM55M_APP_S/library/sscma_micro_porting/3rdparty/json/cJSON"]
+	path = EPII_CM55M_APP_S/library/sscma_micro_porting/3rdparty/json/cJSON
+	url = https://github.com/DaveGamble/cJSON
+[submodule "EPII_CM55M_APP_S/library/sscma_micro_porting/3rdparty/littlefs/littlefs"]
+	path = EPII_CM55M_APP_S/library/sscma_micro_porting/3rdparty/littlefs/littlefs
+	url = https://github.com/littlefs-project/littlefs

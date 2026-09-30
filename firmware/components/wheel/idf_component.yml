@@ -1,0 +1,8 @@
+dependencies:
+  idf: ">=5.0.0"
+  espressif/knob:
+    version: "0.1.4"
+  # esp_lvgl_port.h does `#if __has_include("iot_knob.h")` -> #include "iot_button.h".
+  # Without the button component in the build that include fails, so pull it in.
+  espressif/button:
+    version: "^3.2.0"

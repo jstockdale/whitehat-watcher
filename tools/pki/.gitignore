@@ -1,0 +1,7 @@
+# Watcher PKI: private key material must NEVER be committed.
+*_private*
+tier0*
+*.key
+*.pem
+*.p12
+*.pfx

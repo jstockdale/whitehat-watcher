@@ -1,0 +1,9 @@
+{
+ "b64": "V01TMgEAcGFnZS0wMQAAAAAAAAAAAAYAAAAAAAAAgCShg5kBAAAAAHsidCI6InN0YXR1cyIsInVwdGltZV9zIjo2MX2ZvqgY1WrakGdua7glrKkQ",
+ "body": "{\"t\":\"status\",\"uptime_s\":61}",
+ "name": "mac-only",
+ "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+ "topic": "watcher/telemetry",
+ "want": "OK",
+ "want_log": ""
+}

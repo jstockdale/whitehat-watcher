@@ -1,0 +1,9 @@
+{
+ "b64": "V01TMgEBcGFnZS0wMQAAAAAAAAAAAAEAAAAAAAAAgCShg5kBAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA1c9hE8dKR0HHxCzzbmQfImJy3hqR114AUUkDOHqbhGzWisuNpYAizDL+ANLvzI4UCWUyjPxwczMIRszoVCxeDcc2mjWUKhJHt3PV5TtbJPip8NrtaRNan5sQum3H589hUUqb0XUkVVMYNzuD9eZVZDjQZ1Ay7l2+1XI6/jBHtXffB6dvbBT",
+ "body": "{\"t\":\"snaptest_chunk\",\"id\":7,\"seq\":3,\"total\":40,\"b64\":\"aGVsbG8td29ybGQtZnJhbWUtZGF0YQ==\",\"last\":false}",
+ "name": "replay-then",
+ "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+ "topic": "watcher/telemetry",
+ "want": "REPLAY",
+ "want_log": "SEAL: REPLAY ctr 1 <= 2 from page-01 - DROPPED"
+}

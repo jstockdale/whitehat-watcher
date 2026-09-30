@@ -1,0 +1,9 @@
+{
+ "b64": "V01TMgEBcGFnZS0wMQAAAAAAAAAAAAQAAAAAAAAAwPyXg5kBAAAAAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBHAsLfqoDrsezEFwvTkRbAnLks4K7q2+rfgciAXs6Ok4+LovPwJfDDtEQJsyTXfjtdSC1rFDhCy9sXji3fdGgMycMYViDmR5BQ7dvUIDNGNhnZMuOPQ0hl59ahOUKePGytqKCSqNikg61Ct+K2sMWHx47a5fGzVAmB1X1Ew2Oq9Qu8vGjLmD",
+ "body": "{\"t\":\"snaptest_chunk\",\"id\":7,\"seq\":3,\"total\":40,\"b64\":\"aGVsbG8td29ybGQtZnJhbWUtZGF0YQ==\",\"last\":false}",
+ "name": "stale",
+ "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+ "topic": "watcher/telemetry",
+ "want": "STALE",
+ "want_log": ""
+}

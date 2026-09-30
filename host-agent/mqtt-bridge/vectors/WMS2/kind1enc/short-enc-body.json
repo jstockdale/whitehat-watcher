@@ -1,0 +1,8 @@
+{
+ "b64": "V01TMgEBcGFnZS0wMQAAAAAAAAAAAAMAAAAAAAAAgCShg5kBAAAAAHRvby1zaG9ydBPM9M2/UzHa0NpuVG1JdrI=",
+ "name": "short-enc-body",
+ "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+ "topic": "watcher/telemetry",
+ "want": "SHORT",
+ "want_log": "SEAL: SHORT enc body from page-01 on 'watcher/telemetry' - DROPPED"
+}

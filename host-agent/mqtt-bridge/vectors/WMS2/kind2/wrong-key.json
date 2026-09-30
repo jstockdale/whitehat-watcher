@@ -1,0 +1,7 @@
+{
+ "name": "wrong-key",
+ "b64": "V01TMgIAbXVzZS0wMQAAAAAAAAAAAAEAAAAAAAAAgCShg5kBAAAAAHsiaWQiOiAidDEiLCAiY21kIjogeyJ0IjogImRiZyIsICJjbWQiOiAidmVyc2lvbiJ9fYC2bGsYB1I8NAGJQQJIjEvwHhilWw5m6EiDh2kmQN9BsK5iyb3LzmjiEtD4IlRZSfL396MvfpNtOSrpgJG1Mgs=",
+ "topic": "watcher/command",
+ "want": "BAD_SIG",
+ "want_log": "SEAL: BAD SIGNATURE from muse-01 on 'watcher/command' - DROPPED"
+}

@@ -1,0 +1,75 @@
+# Mosquitto ACL — mqtt.offx1.com (authoritative, 2026-09-25)
+# Pasted by John from the broker's acl_file. Verbatim record.
+
+# ============ muse user (bridge subscriber + Muse agent) ============
+user muse
+# Bridge reads page telemetry, status, audio
+topic read watcher/telemetry
+topic read watcher/status
+topic read watcher/audio
+# Bridge publishes status here; also receives console pings
+topic readwrite watcher/bridge
+# Muse agent sends device commands (bridge does not need to read these)
+topic write watcher/command
+# Bridge monitors keepalive and jiggler state (page publishes)
+topic read watcher/keepalive
+topic read watcher/jiggle
+# Muse driving state: agent publishes, bridge monitors
+topic readwrite watcher/muse
+# Pause state: bidirectional (page publishes pill clicks, agent publishes remote pause)
+topic readwrite watcher/muse_pause
+# Command queue: bidirectional (page publishes depth, agent can clear)
+topic readwrite watcher/muse_queue
+# Heartbeats: bridge listens (added 2026-09-25; no consumer in subscriber.py yet)
+topic read watcher/heartbeat
+topic read watcher/console_heartbeat
+
+# ============ watcher user (console page) ============
+user watcher
+# Page publishes telemetry and status to the bridge
+topic write watcher/telemetry
+topic write watcher/status
+# Bridge status and ping: page receives status, sends pings
+topic readwrite watcher/bridge
+# Device commands: page receives from agent only
+topic read watcher/command
+# Keepalive and jiggler: page publishes config, receives remote state
+topic readwrite watcher/keepalive
+topic readwrite watcher/jiggle
+# Muse driving state: page receives only
+topic read watcher/muse
+# Pause state: bidirectional
+topic readwrite watcher/muse_pause
+# Command queue: bidirectional
+topic readwrite watcher/muse_queue
+
+# ---- Auditor notes (Muse, 2026-09-25) ----
+# 1. No ACL entry for watcher/heartbeat or watcher/console_heartbeat,
+#    yet the console publishes to both (forwardDeviceHeartbeat,
+#    mqttConsoleHeartbeat). Mosquitto default-denies unmatched topics
+#    when acl_file is set -> these publishes are silently dropped.
+#    Either add `topic write watcher/heartbeat` (+ console_heartbeat)
+#    for the watcher user, or stop publishing them.
+# 2. No user has write on watcher/audio (muse: read; watcher: none).
+#    The page currently batches audio chunks into watcher/telemetry
+#    instead; watcher/audio is aspirational ("preferred once the
+#    console routes t:audio here" per subscriber.py).
+# 3. muse has read-only on watcher/jiggle and watcher/keepalive:
+#    remote jiggler/keepalive control must go through watcher/command
+#    (sealed), never direct topic writes. Matches the 2026-09-24
+#    silent-drop finding.
+# 4. 2026-09-26: an ACL-vs-topics checker now guards every publish
+#    (topic_acl.py + audit_topics.py, John's go-ahead). Runtime: all bridge
+#    publish paths go through publish_checked(), which blocks topics the ACL
+#    doesn't grant with a loud ACL-DENY banner instead of letting the broker
+#    silently drop them. One-shot scripts raise (non-zero exit); daemons
+#    (subscriber.py bridge_publish, keepalive.py _pub) log-and-skip so the
+#    bridge never dies over a bad topic. Static: audit_topics.py checks
+#    every bridge publish site (AST) + every page mqttPublish site (parsed
+#    from watcher-console.html) against this file; run it before shipping
+#    any bridge/console patch and after any broker ACL change (re-mirror
+#    this file first). Live violations it currently flags: keepalive.py's
+#    retained publishes to watcher/keepalive + watcher/jiggle as muse
+#    (read-only for muse -- silently dropped today), jiggle.py ditto, and
+#    the page's watcher/heartbeat + watcher/console_heartbeat as watcher
+#    (still ungranted -- see note 1).

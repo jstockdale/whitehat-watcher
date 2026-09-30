@@ -1,0 +1,85 @@
+<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Watcher Firmware v0.4.9 — Build Report</title>
+<style>
+body{margin:20px;background:#0a0a0a;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:1100px;margin:0 auto;padding:24px;line-height:1.6}
+h1{color:#fff;font-size:28px;margin-bottom:4px}
+h2{color:#4fc3f7;font-size:20px;margin-top:32px;border-bottom:1px solid #333;padding-bottom:8px}
+h3{color:#81c784;font-size:16px;margin-top:20px}
+.subtitle{color:#888;font-size:14px;margin-bottom:24px}
+.grid{display:flex;gap:16px;flex-wrap:wrap;margin:16px 0}
+.card{background:#1a1a1a;padding:16px;border-radius:8px;flex:1;min-width:280px;margin:8px 0;border:1px solid #2a2a2a}
+.metric{background:#111;padding:14px;margin:8px 0;border-radius:4px;font-family:"SF Mono",Menlo,monospace;font-size:13px;line-height:1.7;overflow-x:auto;border:1px solid #222}
+.success{color:#81c784;font-weight:bold}
+.error{color:#ff8a65;font-weight:bold}
+.warn{color:#ffb74d;font-weight:bold}
+.info{color:#4fc3f7;font-weight:bold}
+table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px}
+th,td{border:1px solid #333;padding:10px 12px;text-align:left}
+th{background:#1f1f1f;color:#4fc3f7;font-weight:600}
+tr:nth-child(even){background:#141414}
+.notes{background:#2a2300;border-left:3px solid #ffc107;padding:12px 16px;margin:12px 0;font-size:14px;border-radius:0 4px 4px 0}
+code{background:#222;padding:2px 6px;border-radius:3px;font-family:"SF Mono",Menlo,monospace;font-size:13px}
+.badge{display:inline-block;padding:4px 12px;border-radius:12px;font-size:12px;font-weight:bold;margin-right:8px}
+.badge-pass{background:#1b3a1b;color:#81c784;border:1px solid #2d5a2d}
+.badge-fail{background:#3a1b1b;color:#ff8a65;border:1px solid #5a2d2d}
+.badge-info{background:#1b2a3a;color:#4fc3f7;border:1px solid #2d4a5a}
+ul{margin:8px 0;padding-left:24px}
+li{margin:6px 0}
+.footer{margin-top:40px;padding-top:16px;border-top:1px solid #333;color:#666;font-size:12px;text-align:center}
+</style></head><body>
+<h1>Watcher Firmware v0.4.9 — Build Report</h1>
+<div class='subtitle'>Build date: 2026-09-27
+<br>SHA-256: <code>dd732a3f7348767868763e73dd03b60a66bdac1f88fa6ebcbf73731402f24cb9</code>
+</div>
+<h2>Pipeline Stages</h2>
+<table><tr><th>Stage</th><th>Status</th><th>Duration</th><th>Output</th></tr>
+<tr><td>Clean ESP-IDF 5.3 build</td><td><span class="badge badge-pass">PASS</span></td><td>~1m</td><td>0 errors, 0 warnings
+</td></tr>
+<tr><td>PSRAM/flash audit (hardened)</td><td><span class="badge badge-pass">PASS</span></td><td><1s</td><td>clean (12 PSRAM-stack tasks, 1 allowlisted; static-stack + name-length checks pass)
+</td></tr>
+<tr><td>WMS2 suite</td><td><span class="badge badge-pass">PASS</span></td><td>~3s</td><td>74/74
+</td></tr>
+<tr><td>WIA1 suite</td><td><span class="badge badge-pass">PASS</span></td><td>~4s</td><td>196/196 (fresh; new test/host_stubs/esp_err.h)
+</td></tr>
+<tr><td>merge-bin</td><td><span class="badge badge-pass">PASS</span></td><td>~8s</td><td>release/watcher-v0.4.9-merged.bin
+</td></tr>
+<tr><td>Binary verification</td><td><span class="badge badge-pass">PASS</span></td><td><1s</td><td>magics ok; partition table + bootloader byte-identical to 0.4.8
+</td></tr>
+</table>
+<h2>Changes</h2>
+<div class='card'><h3>sscma_client tasks renamed (John's names)</h3>
+<div class='metric'><span class='error'>BEFORE:</span> sscma_client_process (20c) / sscma_client_monitor (20c) — xTaskGetHandle asserted strlen < 16 at boot<br>
+<span class='success'>AFTER:</span> sscma_client (12c) / sscma_monitor (13c); all 8 creation sites + hwm_tasks[] updated</div>
+</div>
+<div class='card'><h3>audit: xTaskGetHandle name-length check</h3>
+<div class='metric'><span class='error'>BEFORE:</span> no check — 20-char lookup names panicked at boot (v0.4.8)<br>
+<span class='success'>AFTER:</span> check_task_get_handle_names(): build fails on any >= 16-char lookup (neg+pos tested)</div>
+</div>
+<div class='card'><h3>audit: task-creation name-length check</h3>
+<div class='metric'><span class='error'>BEFORE:</span> no check — 20-char creation names silently truncated by FreeRTOS<br>
+<span class='success'>AFTER:</span> check_task_create_names(): build fails on any >= 16-char xTaskCreate* name (neg+pos tested)</div>
+</div>
+<div class='card'><h3>WIA1 host-test stub</h3>
+<div class='metric'><span class='error'>BEFORE:</span> test_wia1.c could not build on host (no esp_err.h)<br>
+<span class='success'>AFTER:</span> test/host_stubs/esp_err.h added (test-only)</div>
+</div>
+<h2>Binary Verification</h2>
+<div class='grid'>
+<div class='card'><h3>Size</h3><div class='metric'>7,762,246 bytes</div></div>
+<div class='card'><h3>SHA-256</h3><div class='metric' style='word-break:break-all'>dd732a3f7348767868763e73dd03b60a66bdac1f88fa6ebcbf73731402f24cb9</div></div>
+</div>
+<h3>Magic Bytes</h3><table>
+<tr><th>Offset</th><th>Value</th><th>Expected</th><th>Status</th></tr>
+<tr><td><code>0x0</code></td><td><code>e9</code></td><td><code>e9</code></td><td><span class="badge badge-pass">PASS</span></td></tr>
+<tr><td><code>0x8000</code></td><td><code>aa50</code></td><td><code>aa50</code></td><td><span class="badge badge-pass">PASS</span></td></tr>
+<tr><td><code>0x20000</code></td><td><code>e9</code></td><td><code>e9</code></td><td><span class="badge badge-pass">PASS</span></td></tr>
+</table>
+<div class='metric'>Partition table: <span class='success'>byte-identical</span>
+ (vs 0.4.8)
+</div>
+<h2>Next Steps</h2><ul>
+<li>Flash 0.4.9; verify boot past 'led: boot complete' with no xTaskGetHandle assert</li>
+<li>Run {"t":"dbg","cmd":"nvs_stress"} over serial to verify the nvs_task FIFO contract</li>
+</ul>
+<div class='footer'>Generated 2026-09-27 19:11  &bull; Watcher Firmware Build System</div>
+</body></html>

@@ -1,0 +1,12 @@
+{
+ "labels": {
+  "aead": "WMS2-tel-aead-v1",
+  "fp": "WMS2-tel-fp-v1",
+  "mac": "WMS2-tel-mac-v1"
+ },
+ "name": "kdf",
+ "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+ "want_aead_hex": "9830b8616a98e878b382823284263e2df4fccd84558a91d299928d4f47a1ebbe",
+ "want_fp": "8fba6602c6e3b632",
+ "want_mac_hex": "7e0d9533f45268b230e3e95f137ed3285accdb84032068b7d34d5ba87164ef8f"
+}
