@@ -29,7 +29,7 @@
 #include "wakeword.h"
 
 static const char *TAG = "main";
-#define FW_VERSION "0.4.12"
+#define FW_VERSION "0.4.13"
 
 static void on_ble_event(bool connected)
 {

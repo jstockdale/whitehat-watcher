@@ -323,8 +323,15 @@ esp_err_t eyes_init(void)
         }
     }
     if (merr != ESP_OK) {
-        ESP_LOGE(TAG, "Himax not answering; eyes staying down");
-        return ESP_FAIL;
+        if (merr == ESP_ERR_NOT_SUPPORTED) {
+            /* v0.4.5+: capture-only Himax has no TFLM engine, so MODEL
+             * is deliberately unsupported. This is not a failure —
+             * proceed with sensor-only init for captures. */
+            ESP_LOGI(TAG, "Himax is capture-only (no MODEL support); continuing with sensor-only init");
+        } else {
+            ESP_LOGE(TAG, "Himax not answering; eyes staying down");
+            return ESP_FAIL;
+        }
     }
 
     ready_ = true;
@@ -435,8 +442,12 @@ esp_err_t eyes_recover_camera(bool cycle_rail)
         vTaskDelay(pdMS_TO_TICKS(300));
     }
     if (merr != ESP_OK) {
-        ESP_LOGE(TAG, "Himax not answering after recovery");
-        return merr;
+        if (merr == ESP_ERR_NOT_SUPPORTED) {
+            ESP_LOGI(TAG, "Himax is capture-only; continuing recovery with sensor-only init");
+        } else {
+            ESP_LOGE(TAG, "Himax not answering after recovery");
+            return merr;
+        }
     }
     int applied_opt = -1;
     char detail[64] = {0};
