@@ -291,6 +291,28 @@ Each line: `[CATEGORY] key=value key=value ...`
 - Default: `info`
 - The SD card boot log captures exactly what the USB console would show at the current loglevel — enabling headless-run debugging by pulling the card.
 
+### 7.6 Himax AT traffic logging (approved 2026-09-29)
+
+Log every AT command sent to the Himax and its response at `debug` level. Invaluable for post-mortem on SPI transport issues and failed captures.
+
+- In `sscma_client` send path: `ESP_LOGD("himax_at", "TX: %s", cmd)`
+- In response handler: `ESP_LOGD("himax_at", "RX: %s", response)`
+- Truncate to 256 chars per line to avoid flooding on large responses
+- At `info` and above: log only failures (timeouts, error codes)
+
+**Note:** This is S3-side and could be pulled forward into a 0.4.x point release to aid v0.4.4 RAW capture validation, independent of the full 0.5.0 SD work.
+
+### 7.7 MQTT log stream (separate spec — approved 2026-09-29)
+
+The global loglevel principle (§7.5) implies logs should also stream over MQTT, but this is new work requiring its own design. Split into a separate small spec covering:
+- Topic design (e.g., `watcher/log` — check ACL grants)
+- Rate limiting (log bursts must not flood the broker)
+- Loglevel filtering (does the MQTT stream respect the global level, or have its own?)
+- Seal implications (are log lines sealed? Probably not — they're diagnostic, but decide explicitly)
+- Backpressure (what happens when MQTT is slow/disconnected? Drop, buffer, or block?)
+
+Do not implement MQTT log streaming as an implicit side effect of SD support.
+
 ---
 
 ## 8. Error Handling & Edge Cases
@@ -323,6 +345,8 @@ Each line: `[CATEGORY] key=value key=value ...`
 - [ ] `sdspi` init, card detect via expander P04
 - [ ] FATFS mount at `/sdcard`, `ff_memalloc` → PSRAM override
 - [ ] `{"t":"dbg","cmd":"sd"}` status command (mounted, size, free)
+- [ ] `{"t":"dbg","cmd":"sd_ls","path":"/sdcard/watcher/captures"}` — list files (name, size, mtime). No card pull needed to inspect.
+- [ ] `{"t":"dbg","cmd":"sd_rm","path":"..."}` — delete file(s), requires explicit `"confirm":true` in the command. Never deletes without confirmation.
 - [ ] Handle insertion/removal gracefully
 - **Depends on:** PSRAM stack migration (for internal RAM) OR `ff_memalloc` PSRAM override
 - **Test:** mount/unmount, card detect, `dbg sd` output
