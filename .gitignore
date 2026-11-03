@@ -32,3 +32,6 @@ Thumbs.db
 __pycache__/
 *.pyc
 .venv/
+
+# Vendor secure-boot sample keys: on disk for the Himax image tool only, never in git
+**/secureboot_tool/cert/key/
