@@ -71,6 +71,19 @@ void eyes_status(cJSON *o);
  *  Synchronous; waits up to ~3 s for the reply. */
 esp_err_t eyes_at(const char *cmd, char *out, size_t out_len);
 
+/** Capture a RAW8 image from the Himax over the SPI bulk path
+ *  (v0.4.14 P1). AT+SPIDUMP captures a fresh frame on the Himax; the frame
+ *  is drained with per-chunk CRC16 and verified against the Himax-reported
+ *  SHA-256. buf must hold the frame (1296x972 = 1,259,712 bytes at the
+ *  default sensor opt, or the active AT+CROP window up to the same byte
+ *  budget); out_len receives the actual byte count (NULL ok), out_w/out_h
+ *  receive the frame geometry from the SPIDUMP reply (NULL ok).
+ *  Synchronous; takes several seconds. Returns ESP_OK on a verified frame,
+ *  ESP_ERR_INVALID_STATE if the link isn't up, ESP_ERR_INVALID_SIZE if
+ *  buf is too small, ESP_ERR_INVALID_CRC on hash mismatch. */
+esp_err_t eyes_raw_pull(uint8_t *buf, size_t buf_len, size_t *out_len,
+                        uint32_t *out_w, uint32_t *out_h);
+
 /** Invoke without JPEG (results-only). Tests whether the Himax can produce
  *  frames at the current sensor resolution when image encoding is skipped.
  *  Synchronous; waits up to ~10s. Returns ESP_OK if the Himax replied
@@ -88,12 +101,13 @@ esp_err_t eyes_invoke_noimg(void);
 esp_err_t eyes_set_sensor_opt(int opt_id, int *applied_opt,
                               char *detail_out, size_t detail_len);
 
-/** Analysis of one captured JPEG frame (no Wi-Fi needed). */
+/** Analysis of one captured PNG frame (no Wi-Fi needed).
+ * v0.4.18.37: Migrated from JPEG to PNG (S3 ROM miniz encoder). */
 typedef struct {
-    int bytes;          /* JPEG size in bytes */
+    int bytes;          /* PNG size in bytes */
     int ms;             /* capture time */
-    bool soi;           /* starts with FFD8 */
-    bool eoi;           /* ends with FFD9 */
+    bool soi;           /* starts with PNG signature 89504E47 */
+    bool eoi;           /* ends with IEND chunk (AE426082) */
     uint32_t fnv1a;     /* checksum of the frame */
     uint8_t min_b;      /* byte stats: flat image => min==max */
     uint8_t max_b;
@@ -124,10 +138,65 @@ void eyes_set_snaptest_cb(eyes_snaptest_cb_t cb);
 esp_err_t eyes_snap_test_async(int id, bool send, bool fresh, const char *mid);
 
 /** Chunked base64 streaming of the captured frame. seq runs 0..total-1.
- *  `mid` is the originating command's _mid for correlation. */
-typedef void (*eyes_snaptest_chunk_cb_t)(int id, const char *mid, int seq,
+ *  `mid` is the originating command's _mid for correlation.
+ *  v0.4.18.84: Returns false to abort the transfer (e.g. transport stuck).
+ *  A dropped chunk corrupts the PNG, so abort is the only safe option. */
+typedef bool (*eyes_snaptest_chunk_cb_t)(int id, const char *mid, int seq,
                                          int total, const char *b64);
 void eyes_set_snaptest_chunk_cb(eyes_snaptest_chunk_cb_t cb);
+
+/** Chunked base64 streaming of a captured PNG (see eyes_capture_png).
+ *  seq runs 0..total-1.
+ *  v0.4.18.84: Returns false to abort (see above). */
+typedef bool (*eyes_png_chunk_cb_t)(int seq, int total, const char *b64);
+void eyes_set_png_chunk_cb(eyes_png_chunk_cb_t cb);
+
+/** Capture a full-resolution frame via AT+SPIDUMP + SPI bulk read,
+ *  encode it as PNG (BGGR, SUB filter), and stream the PNG as base64
+ *  chunks through the png chunk callback. Returns ESP_OK on success.
+ *  v0.4.15 (P4): if an AT+CROP window is active on the Himax, the window
+ *  is captured and encoded at its native geometry (from the SPIDUMP
+ *  reply); otherwise the standard 1296x972 frame. */
+esp_err_t eyes_capture_png(void);
+
+/** Capture a full-resolution frame via AT+SPIDUMP + SPI bulk read,
+ *  encode it as PNG (BGGR, SUB filter), and stream the PNG as base64
+ *  chunks through the png chunk callback. Returns ESP_OK on success.
+ *  v0.4.15 (P4): if an AT+CROP window is active on the Himax, the window
+ *  is captured and encoded at its native geometry (from the SPIDUMP
+ *  reply); otherwise the standard 1296x972 frame. */
+
+/** Chunked base64 streaming of one P5 strip (see eyes_capture_strips).
+ *  strip_idx runs 0..strip_count-1; y0/h describe the strip's window in
+ *  the 2592x1944 full-res frame; seq runs 0..total-1 within the strip. */
+typedef void (*eyes_strip_chunk_cb_t)(uint32_t strip_idx, uint32_t strip_count,
+                                      uint32_t y0, uint32_t h,
+                                      uint32_t seq, uint32_t total,
+                                      const char *b64);
+void eyes_set_strip_chunk_cb(eyes_strip_chunk_cb_t cb);
+
+/** Set / clear the Himax full-res crop window (v0.4.15 P4, AT+CROP).
+ *  eyes_set_crop programs the 2592x1944 sensor mode with a 1:1 window;
+ *  geometry must be even and fit the byte budget (see AT+CROP docs).
+ *  eyes_clear_crop restores the 1296x972 raw preset. Both are synchronous
+ *  (the set re-inits the sensor, ~1 s). Returns the Himax reply status. */
+esp_err_t eyes_set_crop(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+esp_err_t eyes_clear_crop(void);
+
+/** Strip capture (v0.4.15 P5): tile the 2592x1944 full-res frame into
+ *  2592x486 strips (byte-identical to the 1296x972 frame budget) and
+ *  stream each strip as base64 chunks through the strip chunk callback.
+ *  overlap_rows (must be even, default 0) adds Bayer-safe overlap between
+ *  adjacent strips for motion QA; the strip count follows
+ *  n = ceil((1944-ov)/(486-ov)) (4 at ov=0, 5 at ov=16). The crop window
+ *  is cleared on exit, leaving the 1296x972 mode. Synchronous; takes
+ *  ~10-20 s for the full set. */
+esp_err_t eyes_capture_strips(uint16_t overlap_rows);
+
+/* v0.4.18.11: SPI channel self-test. Runs 16 test patterns (4 patterns x
+ * 4 sizes), verifies CRC and data integrity. Results is an optional
+ * cJSON array that receives per-test results. Returns ESP_OK if all pass. */
+esp_err_t eyes_spi_test(cJSON *results, cJSON *params);
 
 #ifdef __cplusplus
 }

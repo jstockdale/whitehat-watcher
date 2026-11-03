@@ -80,6 +80,7 @@ void initDefaultModel(Encoder& encoder) {
 
     std::vector<std::string> args{"INIT@MODEL", std::to_string(static_cast<int>(model_id))};
     configureModel(args, *transport, encoder, true);
+    broadcastInitEvent(encoder);
 }
 
 void getModelInfo(const std::vector<std::string>& args, Transport& transport, Encoder& encoder) {

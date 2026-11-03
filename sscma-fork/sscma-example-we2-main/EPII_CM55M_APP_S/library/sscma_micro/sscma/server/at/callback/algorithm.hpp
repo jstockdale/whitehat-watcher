@@ -57,6 +57,7 @@ void initDefaultAlgorithm(Encoder& encoder) {
 
     std::vector<std::string> args{"INIT@ALGORITHM", std::to_string(static_cast<int>(algorithm_id))};
     configureAlgorithm(args, *transport, encoder, true);
+    broadcastInitEvent(encoder);
 }
 
 void getAlgorithmInfo(const std::vector<std::string>& argv, Transport& transport, Encoder& encoder) {

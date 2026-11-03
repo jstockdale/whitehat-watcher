@@ -23,6 +23,18 @@ void link_set_fw_version(const char *v);
  *  heap squeeze -- never fail quietly again.) */
 esp_err_t link_send(cJSON *obj);
 
+/** v0.4.18.81: Ring fill level (0-100%) for PNG chunk flow control.
+ * 100 = full or unavailable (conservative). */
+int link_ring_fill_pct(void);
+
+/** Block until the ring has required_bytes free PLUS headroom.
+ * (v0.4.21: the headroom keeps post-push backlog off 100% so stray log
+ * writes can't lap the TX reader into chunk data — see
+ * docs/chunk-loss-rca-2026-11-02.md.)
+ * Returns true when space is available, false on timeout_ms expiry.
+ * Watchdog-friendly (50ms delays). */
+bool link_wait_for_ring_space(uint32_t timeout_ms, size_t required_bytes);
+
 /** Convenience: {"t":"ok","cmd":"<cmd>"} (+ "_mid" when set).
  *  Returns link_send()'s result; callers may ignore it. */
 esp_err_t link_respond_ok(const char *cmd);

@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# subscriber-supervised.sh — run subscriber.py in the foreground and
+# record HOW it exited. DRAFT — not installed; awaiting John's go.
+#
+# Why: the exit-diagnostics patch (applied 2026-10-18) logged nothing
+# for the four deaths that followed it (watchdog restarts 08:36, 10:16,
+# 11:41, 13:13 UTC, 2026-10-18). Zero [exit-diag] lines, zero
+# "loop_forever returned/raised" lines — so those deaths were not
+# SIGTERM/SIGINT/SIGHUP, not a clean exit, not SystemExit. The remaining
+# classes (SIGKILL, SIGSEGV/SIGABRT) cannot be logged from inside the
+# dying process; only the parent's wait status distinguishes them:
+# shell rc = 128+signum (137 = SIGKILL, 139 = SIGSEGV, 134 = SIGABRT).
+#
+# bridge-watchdog.sh currently launches subscriber.py detached via
+# nohup, so no parent ever waits on it and the status is lost. This
+# wrapper is that parent: the watchdog would nohup THIS script instead,
+# and it appends one [exit-status] line to watchdog.log per death.
+# pgrep -f '[s]ubscriber\.py' still matches the child, so the
+# watchdog's alive-check is unchanged.
+set -u
+BRIDGE_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$BRIDGE_DIR"
+PYTHON="$(command -v python3)"
+"$PYTHON" subscriber.py >> subscriber.log 2>&1
+rc=$?
+NOW="$(date -u +%FT%TZ)"
+if [ "$rc" -gt 128 ]; then
+  echo "$NOW [exit-status] subscriber exited rc=$rc (signal $((rc - 128)))" >> "$BRIDGE_DIR/watchdog.log"
+else
+  echo "$NOW [exit-status] subscriber exited rc=$rc" >> "$BRIDGE_DIR/watchdog.log"
+fi
+exit "$rc"

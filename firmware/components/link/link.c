@@ -51,7 +51,8 @@ static const char *TAG = "link";
 static SemaphoreHandle_t tx_lock_ = NULL;
 /* PSRAM task handles (stacks in PSRAM, TCBs internal). link_rx stays on
  * internal RAM — UART drain at priority 9 is timing-critical. */
-static task_psram_handle_t *worker_psram_ = NULL;
+/* v0.4.18.68: worker_psram_ removed — link_worker now uses internal RAM stack
+ * via xTaskCreate (PSRAM stack + NVS/flash ops = crash). */
 static task_psram_handle_t *mon_psram_ = NULL;
 static task_psram_handle_t *hb_psram_ = NULL;
 /* v0.4.6: link_rx runs on PSRAM stack (was 16KB internal). Audit found
@@ -143,51 +144,172 @@ void link_set_fw_version(const char *v)
     }
 }
 /* ------------------------------------------------------------------ */
-/* Retained log ring: every ESP_LOG line is kept (in addition to going */
-/* to the UART) so the host can pull recent history with {"t":"logs"}. */
-/* Cold path: lives in PSRAM.                                         */
+/* Retained log ring: every ESP_LOG line is kept so the host can pull recent */
+/* history with {"t":"logs"}. The console_tx_task drains to USB via UART.  */
+/* Cold path: lives in PSRAM (v0.4.18.70: moved back from internal to save  */
+/* SRAM; only link_worker needs internal).                                 */
 /* ------------------------------------------------------------------ */
 
-#define LOG_BUF_SIZE 12288
+#define LOG_BUF_SIZE 32768
+/* v0.4.21 (chunk-loss RCA 2026-11-02): headroom kept free after chunk
+ * pushes (see link_wait_for_ring_space) so uncontrolled log writes
+ * can't lap the TX reader into the middle of a chunk. */
+#define LINK_RING_HEADROOM_BYTES 8192
 static char *log_ring_ = NULL;
 static size_t log_head_ = 0;
 static size_t log_valid_ = 0;
+/* v0.4.18.70 (Claude F2): Monotonic counters for retained-history ring.
+ * Writer increments log_written_ by bytes written. TX task tracks tx_read_
+ * (bytes drained). Ring is retained-history only; TX task is a chasing
+ * reader that consumes nothing. */
+static volatile uint64_t log_written_ = 0;  /* total bytes ever written to ring */
+static volatile uint64_t tx_read_ = 0;      /* total bytes ever drained by TX task */
+static uint32_t log_dropped_ = 0;  /* bytes dropped due to writer lapping TX */
+static uint32_t log_laps_ = 0;     /* v0.4.21: TX-reader lap (resync) events */
 static SemaphoreHandle_t log_lock_ = NULL;
 static vprintf_like_t log_orig_vprintf_ = NULL;
+/* v0.4.18.70 (Claude F6a): Deleted dead log_ring_write (no callers, old blocking semantics). */
 
-static void log_ring_write(const char *data, size_t len)
+/* v0.4.18.70 (Claude F1/F2): Ring push. Always writes (overwrite-oldest
+ * for retention), advances head, saturates valid, increments
+ * log_written_. Returns true if written, false if the lock could not be
+ * taken within wait_ticks.
+ * v0.4.22 (chunk-loss RCA follow-up): the wait is parameterized. The log
+ * path (vprintf) must never block -> wait 0 (ring_push_nb). The data
+ * path (link_send) MUST NOT drop an 11KB chunk line on instantaneous
+ * lock contention — 0.4.21 verification run 1 aborted at chunk 42 on
+ * exactly that dice roll. log_lock_ is a leaf lock and every holder is
+ * a bounded byte-copy (worst case the 32KB logs-replay snapshot, ~ms),
+ * so a 250ms take cannot deadlock and effectively never times out
+ * unless the ring is genuinely wedged — which is when failing loud is
+ * correct. */
+static bool ring_push_w(const char *data, size_t len, TickType_t wait_ticks)
 {
-    if (!log_ring_ || !log_lock_) {
-        return;
+    if (!log_ring_ || !log_lock_ || !data || len == 0) {
+        return false;
     }
-    if (xSemaphoreTake(log_lock_, pdMS_TO_TICKS(50)) != pdTRUE) {
-        return;
+    if (xSemaphoreTake(log_lock_, wait_ticks) != pdTRUE) {
+        return false;
     }
     for (size_t i = 0; i < len; i++) {
         log_ring_[log_head_] = data[i];
         log_head_ = (log_head_ + 1) % LOG_BUF_SIZE;
-        if (log_valid_ < LOG_BUF_SIZE) {
-            log_valid_++;
-        }
     }
+    if (log_valid_ + len <= LOG_BUF_SIZE) {
+        log_valid_ += len;
+    } else {
+        log_valid_ = LOG_BUF_SIZE;
+    }
+    log_written_ += len;
     xSemaphoreGive(log_lock_);
+    return true;
+}
+
+/* Non-blocking variant for the log capture path: logs must never block. */
+static bool ring_push_nb(const char *data, size_t len)
+{
+    return ring_push_w(data, len, 0);
+}
+
+/* Blocking variant for the link_send data path (see ring_push_w). */
+static bool ring_push_blocking(const char *data, size_t len)
+{
+    return ring_push_w(data, len, pdMS_TO_TICKS(250));
+}
+
+/* v0.4.18.81: Ring backlog for PNG chunk flow control (John 2026-10-08).
+ * Returns 0-100 (percent of ring size backed up). Measures the actual
+ * TX backlog (log_written_ - tx_read_), NOT log_valid_ which is retained
+ * history that never drains.
+ * v0.4.18.84 (John 2026-10-08): Lock-free read. The counters are volatile;
+ * taking log_lock_ here deadlocked the snaptest task (0.4.18.82). For flow
+ * control, an approximate reading is fine — we just need to know if the
+ * TX task is keeping up. */
+int link_ring_fill_pct(void)
+{
+    if (!log_ring_) {
+        return 100;  /* conservative: assume full if not initialized */
+    }
+    /* Lock-free: volatile reads. May race with TX task updates, but the
+     * values are monotonic counters — a torn read just gives a slightly
+     * stale percentage, which is fine for backpressure. */
+    uint64_t written = log_written_;
+    uint64_t read = tx_read_;
+    uint64_t backlog = (written >= read) ? (written - read) : 0;
+    if (backlog > LOG_BUF_SIZE) backlog = LOG_BUF_SIZE;
+    return (int)((backlog * 100) / LOG_BUF_SIZE);
+}
+
+size_t link_ring_free_bytes(void)
+{
+    if (!log_ring_) {
+        return 0;
+    }
+    uint64_t written = log_written_;
+    uint64_t read = tx_read_;
+    uint64_t backlog = (written >= read) ? (written - read) : 0;
+    if (backlog > LOG_BUF_SIZE) backlog = LOG_BUF_SIZE;
+    return LOG_BUF_SIZE - (size_t)backlog;
+}
+
+/* v0.4.18.81: Wait until the ring has room for a chunk. Blocks (with
+ * watchdog-friendly delays) until fill drops below the low watermark.
+ * v0.4.18.84 (John 2026-10-08): Proper blocking backpressure. The producer
+ * (PNG encoder) waits for the consumer (USB TX task) instead of dropping
+ * data. This is the correct flow control — blocking here is the ONLY case
+ * where blocking is appropriate. Watchdog is fed by the caller's periodic
+ * yields. */
+bool link_wait_for_ring_space(uint32_t timeout_ms, size_t required_bytes)
+{
+    uint32_t waited = 0;
+    /* v0.4.18.88 (2026-10-08): Wait for EXACT required space, not just 50%.
+     * The old 50% watermark (6KB free) was insufficient for 11KB chunk JSONs.
+     * ring_push_nb overwrites when full, corrupting the data. Now we wait
+     * until required_bytes are actually free.
+     * v0.4.21 (chunk-loss RCA 2026-11-02): HEADROOM. Exact space left the
+     * ring at 100% after a chunk push; any uncontrolled log write then
+     * lapped the chasing TX reader, which silently deleted a mid-stream
+     * span (observed: a chunk's base64 arriving 342 chars short). Wait
+     * for required + headroom so post-push backlog stays <= 24K and
+     * stray log bursts are absorbed instead of deleting chunk bytes. */
+    size_t target = required_bytes + LINK_RING_HEADROOM_BYTES;
+    if (target > LOG_BUF_SIZE) {
+        target = LOG_BUF_SIZE;
+    }
+    while (link_ring_free_bytes() < target) {
+        if (waited >= timeout_ms) {
+            return false;
+        }
+        /* 50ms delay: gives TX task time to drain ~500 bytes at 115200.
+         * Longer than the 20ms in 0.4.18.81 to reduce CPU spin. */
+        vTaskDelay(pdMS_TO_TICKS(50));
+        waited += 50;
+    }
+    return true;
 }
 
 static int log_capture_vprintf(const char *fmt, va_list args)
 {
+    /* v0.4.18.70 (Claude F2): Writers never block. Format into stack
+     * buffer, push to ring via ring_push_nb (overwrite-oldest), return.
+     * Do NOT call log_orig_vprintf_ here — that would do synchronous USB
+     * I/O in the caller's task context. The console_tx_task drains. */
     char buf[256];
     int n = vsnprintf(buf, sizeof(buf), fmt, args);
     if (n > 0) {
-        log_ring_write(buf, (size_t)(n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1));
-    }
-    if (log_orig_vprintf_) {
-        return log_orig_vprintf_(fmt, args);
+        size_t len = (size_t)(n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1);
+        if (!ring_push_nb(buf, len)) {
+            /* Lock unavailable: count as dropped (benignly racy, no lock). */
+            log_dropped_ += (uint32_t)len;
+        }
     }
     return n;
 }
 
 static void log_capture_init(void)
 {
+    /* v0.4.18.70: Ring BACK to PSRAM. It's just a data buffer, no need for
+     * internal RAM. The 0.4.18.68/69 internal allocation exhausted SRAM. */
     log_ring_ = heap_caps_malloc(LOG_BUF_SIZE, MALLOC_CAP_SPIRAM);
     log_lock_ = xSemaphoreCreateMutex();
     if (log_ring_ && log_lock_) {
@@ -195,6 +317,60 @@ static void log_capture_init(void)
         ESP_LOGI(TAG, "log ring ready (%d bytes, PSRAM)", LOG_BUF_SIZE);
     } else {
         ESP_LOGW(TAG, "log ring unavailable");
+    }
+}
+
+/* v0.4.18.68 (Claude 2026-10-08): Dedicated console TX task. Drains the log
+ * ring to USB at low priority (3). If USB blocks (50ms/byte spin), only this
+ * task stalls — nimble_host, link_worker, and snaptest are unaffected. */
+/* v0.4.18.70 (Claude F2): Dedicated console TX task. Chasing reader that
+ * consumes nothing — the ring is retained-history only. Uses monotonic
+ * counters: lag = log_written_ - tx_read_. If lag > LOG_BUF_SIZE, the writer
+ * lapped us; resync to oldest retained and count dropped bytes. */
+static void console_tx_task(void *arg)
+{
+    (void)arg;
+    char chunk[256];
+    while (1) {
+        size_t to_send = 0;
+        if (xSemaphoreTake(log_lock_, pdMS_TO_TICKS(10)) == pdTRUE) {
+            uint64_t written = log_written_;
+            uint64_t read = tx_read_;
+            uint64_t lag = (written >= read) ? (written - read) : 0;
+            if (lag > LOG_BUF_SIZE) {
+                /* Writer lapped us: count dropped, resync to oldest retained. */
+                log_dropped_ += (uint32_t)(lag - LOG_BUF_SIZE);
+                log_laps_++;
+                tx_read_ = written - LOG_BUF_SIZE;
+                lag = LOG_BUF_SIZE;
+                read = tx_read_;
+            }
+            if (lag > 0) {
+                /* Copy up to 256 bytes starting at (head - lag). */
+                to_send = (lag < sizeof(chunk)) ? (size_t)lag : sizeof(chunk);
+                size_t head = log_head_;
+                /* Start position: head - lag (oldest unread byte). */
+                size_t start = (head + LOG_BUF_SIZE - (size_t)(lag % LOG_BUF_SIZE)) % LOG_BUF_SIZE;
+                for (size_t i = 0; i < to_send; i++) {
+                    chunk[i] = log_ring_[(start + i) % LOG_BUF_SIZE];
+                }
+                tx_read_ += to_send;
+            }
+            xSemaphoreGive(log_lock_);
+        }
+        /* Send via fwrite to USB. This may spin 50ms/byte if host isn't
+         * draining, but we're priority 3 — nobody cares. */
+        if (to_send > 0) {
+            fwrite(chunk, 1, to_send, stdout);
+            fflush(stdout);
+            /* v0.4.18.70 (Claude Q7): Yield after each burst so lower/equal
+             * priority tasks (link_mon pri 3, link_hb pri 2) always breathe,
+             * even during USB stall spin. */
+            vTaskDelay(1);
+        } else {
+            /* No data: yield to avoid busy loop. */
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
 }
 
@@ -280,17 +456,56 @@ esp_err_t link_send(cJSON *obj)
         ESP_LOGE(TAG, "link_send: serialization failed");
         return ESP_ERR_NO_MEM;
     }
-    printf("%s\n", s);
-    fflush(stdout);
+    /* v0.4.18.70 (Claude F1): Restore USB output via ring (non-blocking).
+     * Push JSON line to the shared log ring; console_tx_task drains to USB.
+     * v0.4.18.81 (John 2026-10-08): PNG chunks flow through USB again, but
+     * with watermark flow control. The PNG sink callbacks (eyes.c) call
+     * link_wait_for_ring_space() before each chunk, pacing the encoder to
+     * the USB drain rate. This avoids both the 0.4.18.79 wedge (firehose)
+     * and the 0.4.18.80 blackout (drop everything). */
+    esp_err_t push_err = ESP_OK;
+    {
+        size_t slen = strlen(s);
+        /* v0.4.18.87 (2026-10-08): Atomic single push. The JSON + newline
+         * MUST go in one ring_push_nb call. Two separate pushes allow a
+         * log line from another task to interleave between them, corrupting
+         * the JSON (page sees JSON without newline, misclassifies as log).
+         * This was dropping ~6/188 snaptest chunks. */
+        char *line = (char *)malloc(slen + 2);
+        if (line) {
+            memcpy(line, s, slen);
+            line[slen] = '\n';
+            line[slen + 1] = '\0';
+            if (!ring_push_blocking(line, slen + 1)) {
+                /* v0.4.21 (chunk-loss RCA 2026-11-02): a failed push
+                 * drops the whole line — count it here and report
+                 * failure so chunk senders abort instead of silently
+                 * shipping a holed image.
+                 * v0.4.22: the push waits up to 250ms for log_lock_
+                 * (ring_push_blocking), so reaching this branch means
+                 * the ring is genuinely wedged, not a contention dice
+                 * roll — failing loud is the correct outcome. */
+                log_dropped_ += (uint32_t)(slen + 1);
+                push_err = ESP_FAIL;
+                ESP_LOGE(TAG, "link_send: ring push failed — line dropped");
+            }
+            free(line);
+        } else {
+            log_dropped_ += (uint32_t)(slen + 1);
+            push_err = ESP_ERR_NO_MEM;
+            ESP_LOGE(TAG, "link_send: line buffer alloc failed — dropped");
+        }
+    }
     /* Native-MQTT TX mirror: offer the line to the broker while native
      * mode is up. Non-blocking by contract; the line buffer is still
-     * valid here. */
+     * valid here. Offered even when the serial ring push failed — the
+     * native path is independent of ring state. */
     if (tx_mirror_cb_) {
         tx_mirror_cb_(s, strlen(s));
     }
     free(s);
     xSemaphoreGive(tx_lock_);
-    return ESP_OK;
+    return push_err;
 }
 
 /* Forward declaration: the terminal gate lives in the registry section. */
@@ -543,6 +758,13 @@ static void link_heartbeat_task(void *arg)
             cJSON_AddNumberToObject(o, "psram_free",
                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
             cJSON_AddNumberToObject(o, "tasks", uxTaskGetNumberOfTasks());
+            /* v0.4.21 (chunk-loss RCA 2026-11-02): ring drop observability.
+             * log_dropped = bytes lost (TX-reader laps + whole lines
+             * dropped on ring-push lock contention); log_laps = lap
+             * events. Deltas across a snaptest convict or clear the ring
+             * as the chunk-loss source. */
+            cJSON_AddNumberToObject(o, "log_dropped", (double)log_dropped_);
+            cJSON_AddNumberToObject(o, "log_laps", (double)log_laps_);
             /* v0.4.3 (R5): per-task stack high-water marks (bytes) for
              * the internal-stack tasks, so the next RAM pass can trim
              * stacks from measured data instead of guesses. Only tasks
@@ -558,6 +780,8 @@ static void link_heartbeat_task(void *arg)
                     "nvs_task", "sscma_client",
                     "sscma_monitor", "mqtt_native",
                     "snap", "snaptest",
+                    /* v0.4.18.70 (Claude F6g): Track console_tx HWM. */
+                    "console_tx",
                 };
                 cJSON *hwm = cJSON_CreateObject();
                 for (size_t i = 0;
@@ -1382,6 +1606,114 @@ static void handle_command(cJSON *cmd)
             link_send_term(o);
             return;
         }
+        if (strcmp(sub, "png") == 0) {
+            /* v0.4.14 (P2): capture a full frame via AT+SPIDUMP + SPI bulk
+             * read, encode as PNG, and stream it as {t:"png_chunk"} events
+             * (base64). Read op — safe over MQTT, not serial-gated. Runs
+             * synchronously; the terminal {t:"dbg",cmd:"png"} reply lands
+             * after the last chunk. */
+            esp_err_t err = eyes_capture_png();
+            cJSON *o = dbg_new("png");
+            cJSON_AddBoolToObject(o, "ok", err == ESP_OK);
+            if (err != ESP_OK) {
+                cJSON_AddStringToObject(o, "err", esp_err_to_name(err));
+            }
+            link_send_term(o);
+            return;
+        }
+        /* v0.4.18.69: Report stack high-water marks for SRAM optimization.
+         * Helps right-size task stacks (Claude Q4). */
+        if (strcmp(sub, "stacks") == 0) {
+            cJSON *o = dbg_new("stacks");
+            cJSON *tasks = cJSON_CreateArray();
+            /* Get HWM for current task (link_worker). */
+            {
+                UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+                cJSON *t = cJSON_CreateObject();
+                cJSON_AddStringToObject(t, "name", "link_worker");
+                cJSON_AddNumberToObject(t, "hwm_words", (double)hwm);
+                cJSON_AddNumberToObject(t, "hwm_bytes", (double)(hwm * sizeof(StackType_t)));
+                cJSON_AddItemToArray(tasks, t);
+            }
+            cJSON_AddItemToObject(o, "tasks", tasks);
+            cJSON_AddNumberToObject(o, "dropped_logs", (double)log_dropped_);
+            link_send(o);
+            return;
+        }
+        if (strcmp(sub, "spitest") == 0) {
+            /* v0.4.18.11: SPI channel self-test. Runs 16 test patterns
+             * (4 patterns x 4 sizes) through CMD_TEST_PATTERN, verifies
+             * CRC and data integrity. Isolates SPI transport from camera.
+             * Requires Himax 0.4.20.11+ (CMD_TEST_PATTERN support).
+             * v0.4.18.19: Accepts optional params: gap_ms, pattern, len,
+             * iterations. Passed through to eyes_spi_test(). */
+            cJSON *o = dbg_new("spitest");
+            cJSON *results = cJSON_CreateArray();
+            /* The dbg command JSON itself contains the params */
+            esp_err_t err = eyes_spi_test(results, cmd);
+            cJSON_AddBoolToObject(o, "ok", err == ESP_OK);
+            cJSON_AddItemToObject(o, "tests", results);
+            if (err != ESP_OK) {
+                cJSON_AddStringToObject(o, "err", esp_err_to_name(err));
+            }
+            link_send_term(o);
+            return;
+        }
+        if (strcmp(sub, "crop") == 0) {
+            /* v0.4.15 (P4): set/clear/query the Himax full-res crop window.
+             * {"t":"dbg","cmd":"crop","args":"x,y,w,h"} -> AT+CROP (enters
+             *   2592x1944 1:1 mode);
+             * {"t":"dbg","cmd":"crop","args":"clear"} -> AT+CROP=0,0,0,0;
+             * {"t":"dbg","cmd":"crop"} -> AT+CROP? query.
+             * A set is followed by {"t":"dbg","cmd":"png"} to capture. */
+            cJSON *o = dbg_new("crop");
+            esp_err_t err = ESP_OK;
+            const char *args = opt_str(cmd, "args");
+            if (args && *args) {
+                if (strcmp(args, "clear") == 0) {
+                    err = eyes_clear_crop();
+                } else {
+                    unsigned x = 0, y = 0, w = 0, h = 0;
+                    if (sscanf(args, "%u,%u,%u,%u", &x, &y, &w, &h) == 4) {
+                        err = eyes_set_crop((uint16_t)x, (uint16_t)y,
+                                            (uint16_t)w, (uint16_t)h);
+                    } else {
+                        err = ESP_ERR_INVALID_ARG;
+                    }
+                }
+            } else {
+                char reply[256];
+                err = eyes_at("AT+CROP?", reply, sizeof(reply));
+                if (err == ESP_OK) {
+                    cJSON_AddStringToObject(o, "crop", reply);
+                }
+            }
+            cJSON_AddBoolToObject(o, "ok", err == ESP_OK);
+            if (err != ESP_OK) {
+                cJSON_AddStringToObject(o, "err", esp_err_to_name(err));
+            }
+            link_send_term(o);
+            return;
+        }
+        if (strcmp(sub, "strip") == 0) {
+            /* v0.4.15 (P5): tile the 2592x1944 full-res frame into 2592x486
+             * strips and stream each as {t:"strip_chunk"} events (base64).
+             * {"t":"dbg","cmd":"strip"} -> overlap 0 (4 strips);
+             * {"t":"dbg","cmd":"strip","overlap":16} -> 5 strips.
+             * Read op — safe over MQTT. The crop window is cleared on exit. */
+            cJSON *ov = cJSON_GetObjectItem(cmd, "overlap");
+            uint16_t overlap = (cJSON_IsNumber(ov) && ov->valuedouble >= 0)
+                                   ? (uint16_t)ov->valuedouble : 0;
+            esp_err_t err = eyes_capture_strips(overlap);
+            cJSON *o = dbg_new("strip");
+            cJSON_AddBoolToObject(o, "ok", err == ESP_OK);
+            cJSON_AddNumberToObject(o, "overlap", overlap);
+            if (err != ESP_OK) {
+                cJSON_AddStringToObject(o, "err", esp_err_to_name(err));
+            }
+            link_send_term(o);
+            return;
+        }
         if (strcmp(sub, "mem") == 0) {
             /* Alias of heap (the console's memory button uses "mem"). */
             cJSON *o = dbg_new("mem");
@@ -1666,8 +1998,17 @@ static void handle_command(cJSON *cmd)
                     }
                 }
             }
-            char out[512];
-            esp_err_t err = eyes_at(at, out, sizeof(out));
+            /* v0.4.14 (P0.3): the reply buffer is heap-allocated (PSRAM) at
+             * 4 KiB. AT+RAWREAD returns ~2.8 KiB and was silently truncated
+             * to 511 chars by the old 512-byte stack buffer. A 4 KiB stack
+             * buffer is unsafe here — the link worker task has an 8 KiB
+             * stack. */
+            char *out = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+            if (!out) {
+                link_respond_err(t, "no mem for at reply");
+                return;
+            }
+            esp_err_t err = eyes_at(at, out, 4096);
             if (err == ESP_OK) {
                 cJSON *o = dbg_new("at");
                 cJSON_AddStringToObject(o, "reply", out);
@@ -1678,6 +2019,7 @@ static void handle_command(cJSON *cmd)
                          esp_err_to_name(err));
                 link_respond_err(t, msg);
             }
+            heap_caps_free(out);
             return;
         }
         if (strcmp(sub, "ai") == 0) {
@@ -1959,21 +2301,41 @@ esp_err_t link_init(void)
     }
     /* Retain ESP_LOG history for the {"t":"logs"} debug command. */
     log_capture_init();
+    /* v0.4.18.70: console_tx uses PSRAM stack (not internal). It only does
+     * USB writes, no flash ops. Internal RAM is precious (only 16KB free).
+     * The 0.4.18.68 internal allocation contributed to SRAM exhaustion. */
+    {
+        TaskHandle_t tx_handle = NULL;
+        /* Use task_psram_create for PSRAM stack. */
+        task_psram_handle_t *tx_psram = task_psram_create(console_tx_task, "console_tx",
+                                                          4096, NULL, 3, tskNO_AFFINITY);
+        if (!tx_psram) {
+            ESP_LOGE(TAG, "console TX task creation failed");
+        }
+        (void)tx_handle; /* unused with psram_create */
+    }
     /* Worker executes commands; RX only frames/parses/enqueues so the
      * UART never overflows while a slow handler runs. RX runs one notch
      * above the worker so drain latency stays minimal. The monitor
      * enforces command deadlines at low priority. The AI-thinking LED
      * timer is created on first use.
      *
-     * RAM: worker/mon/hb stacks live in PSRAM (they do no flash ops and
+     * RAM: mon/hb stacks live in PSRAM (they do no flash ops and
      * are not timing-critical). link_rx stays internal — UART drain at
-     * priority 9 cannot tolerate PSRAM cache-miss jitter. */
-    worker_psram_ = task_psram_create(link_worker_task, "link_worker", 4096,
-                                      NULL, 8, tskNO_AFFINITY);
-    if (!worker_psram_) {
+     * priority 9 cannot tolerate PSRAM cache-miss jitter.
+     * v0.4.18.68 (Claude 2026-10-08): link_worker MUST use internal RAM stack,
+     * not PSRAM. It does NVS/flash ops; PSRAM becomes inaccessible during
+     * flash writes → crash. v0.4.18.70: worker is internal (16KB); mon/hb
+     * remain PSRAM.
+     * flash writes → crash. This is a crash-in-waiting. */
+    TaskHandle_t worker_handle = NULL;
+    BaseType_t ok = xTaskCreate(link_worker_task, "link_worker", 16384 / sizeof(StackType_t),
+                                NULL, 8, &worker_handle);
+    if (ok != pdPASS) {
         return ESP_FAIL;
     }
     /* v0.4.6: PSRAM stack, 4096 words = 16384 bytes (was 16KB internal). */
+    /* v0.4.18.68: Reverted to internal — PSRAM stack + flash ops = crash. */
     rx_psram_ = task_psram_create(rx_task, "link_rx", 4096 * 4, NULL, 9,
                                  tskNO_AFFINITY);
     if (!rx_psram_) {

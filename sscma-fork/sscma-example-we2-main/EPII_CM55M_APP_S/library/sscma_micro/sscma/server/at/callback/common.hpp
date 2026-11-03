@@ -36,6 +36,9 @@ void get_version(const std::string& cmd, Transport& transport, Encoder& encoder,
     encoder.write("at_api", version);
     encoder.write("software", MA_VERSION);
     encoder.write("hardware", static_resource->device->version());
+#ifdef CAPTURE_ONLY_MODE
+    encoder.write("firmware", WATCHER_FW_ID);
+#endif
     encoder.end();
     transport.send(reinterpret_cast<const char*>(encoder.data()), encoder.size());
 }

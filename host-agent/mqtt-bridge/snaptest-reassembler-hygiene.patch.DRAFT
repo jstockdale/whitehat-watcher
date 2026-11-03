@@ -1,0 +1,93 @@
+# DRAFT — prepared 2026-11-02 by proactive research, NOT applied.
+# Bridge reassembler hygiene fix (RCA fix #3, docs/chunk-loss-rca-2026-11-02.md).
+# Bug reproduced against the live handler: an aborted run's chunks survive in
+# _pending; a later run reusing the same image id fills its gaps with the stale
+# chunks and _save_streaming_png saves a splice (test: saved == B0+A1+B2).
+# Fix: (1) seq-0 for an id with existing chunks resets the stream;
+# (2) strict base64 validation per chunk (truncated b64 now poisons/drops the
+# stream instead of silently decoding short); (3) save requires seqs starting
+# at 0 with no gaps and CLEARS _pending on any validation failure;
+# (4) full PNG chunk walk with CRC verification before saving.
+# Validated offline: splice scenario -> old saves splice, patched refuses;
+# clean complete PNG -> both save byte-identical. Apply + restart subscriber
+# only on John's go, ideally between bench sessions.
+@@ -9,7 +9,9 @@
+ """
+ 
+ import base64
++import binascii
+ import json
++import struct
+ import os
+ import time
+ 
+@@ -53,6 +55,30 @@
+     return None
+ 
+ 
++
++def _png_walk_ok(data: bytes) -> bool:
++    """Walk PNG chunks verifying CRCs; require IHDR first, IEND last, no trailing bytes."""
++    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
++        return False
++    off = 8
++    first = True
++    while off + 8 <= len(data):
++        (length,) = struct.unpack(">I", data[off:off+4])
++        ctype = data[off+4:off+8]
++        end = off + 8 + length + 4
++        if end > len(data):
++            return False
++        crc_stored, = struct.unpack(">I", data[off+8+length:end])
++        if binascii.crc32(data[off+4:off+8+length]) & 0xFFFFFFFF != crc_stored:
++            return False
++        if first and ctype != b"IHDR":
++            return False
++        first = False
++        off = end
++        if ctype == b"IEND":
++            return off == len(data)
++    return False
++
+ def _save_streaming_png(img_id) -> str | None:
+     """Save a completed streaming PNG. Returns path or None."""
+     pending = _pending.get(img_id)
+@@ -68,13 +94,19 @@
+         if not chunks_dict:
+             return None
+         seqs = sorted(chunks_dict.keys())
+-        # Verify no gaps
+-        if seqs != list(range(seqs[0], seqs[-1] + 1)):
++        # Require a complete stream starting at seq 0 — anything else is a
++        # partial or spliced assembly; drop it instead of leaving stale
++        # chunks in _pending to contaminate the next run (RCA 2026-11-02).
++        if not seqs or seqs[0] != 0 or seqs != list(range(seqs[-1] + 1)):
++            del _pending[img_id]
+             return None
+         parts = []
+         for s in seqs:
+-            parts.append(base64.b64decode(chunks_dict[s]))
++            parts.append(base64.b64decode(chunks_dict[s], validate=True))
+         img_data = b"".join(parts)
++        if not _png_walk_ok(img_data):
++            del _pending[img_id]
++            return None
+ 
+         # Verify PNG signature
+         if not img_data.startswith(b"\x89PNG\r\n\x1a\n"):
+@@ -127,6 +159,15 @@
+     except Exception:
+         pass
+ 
++    # A seq-0 chunk for an id that already holds chunks starts a NEW stream:
++    # reset instead of merging into the previous run's leftovers.
++    if seq == 0 and img_id in _pending and _pending[img_id].get("chunks"):
++        del _pending[img_id]
++    try:
++        base64.b64decode(b64_data, validate=True)
++    except Exception:
++        _pending.pop(img_id, None)
++        return None
+     if img_id not in _pending:
+         _pending[img_id] = {"chunks": {}, "total": total, "streaming": streaming, "ordered": []}
+ 

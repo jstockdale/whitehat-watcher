@@ -66,3 +66,20 @@ CONFIG_BOOTLOADER_WDT_DISABLE_IN_USER_CODE=y
 # silently. The spontaneous reboot loop produces no panic/assert logs;
 # we need the task name + backtrace to root-cause it.
 CONFIG_ESP_TASK_WDT_PANIC=y
+
+# v0.4.18.72 (Claude SRAM audit 2026-10-08): SRAM optimization.
+# The default SPIRAM_MALLOC_ALWAYSINTERNAL=16384 means all mallocs <16KB
+# prefer internal RAM, draining it by design. Lower to 1024 so only
+# tiny allocations use internal; everything else goes to PSRAM.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
+
+# v0.4.18.72: NimBLE host allocations to PSRAM (default is internal).
+# Saves ~15-30KB internal SRAM.
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+
+# v0.4.18.72: mbedTLS allocations to PSRAM (default is internal).
+# Saves ~20KB+ per TLS connection.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
+# Heap poisoning for 0.4.18.85 (debug heap corruption)
+CONFIG_HEAP_POISONING_DISABLED=y

@@ -580,6 +580,7 @@ esp_err_t ptt_init(void)
 
     ready_ = true;
     ESP_LOGI(TAG, "ready (hold wheel >%dms to talk)", PTT_HOLD_MS);
+    ESP_LOGI(TAG, "mic ready @ %dHz (codec 0x%02x)", PTT_SAMPLE_RATE, codec_addr7_);
     return ESP_OK;
 }
 

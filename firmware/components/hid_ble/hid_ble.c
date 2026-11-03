@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "nimble/nimble_port.h"
@@ -257,6 +258,21 @@ static volatile bool glide_active_;
 static uint8_t mouse_buttons_ = 0;
 static uint8_t own_addr_type_;
 static hid_ble_event_cb_t event_cb_ = NULL;
+static bool hid_drop_warned_ = false;  /* once-per-connection */
+
+/* NCP-1 revB pairing/consent state. Generation-guarded: prompts and
+ * teardowns bump pair_gen_; a user answer carrying a stale gen is dropped.
+ * Host task writes; UI answers via the public calls. */
+static volatile uint32_t pair_gen_ = 0;
+static uint16_t pair_conn_ = BLE_HS_CONN_HANDLE_NONE;
+static volatile bool pair_waiting_ = false;  /* NC: inject_io owed */
+/* [revB] consent gate */
+static volatile bool conn_approved_ = false;   /* HID TX permitted */
+static volatile bool consent_pending_ = false;
+static bool had_bond_at_connect_ = false;
+static ble_addr_t peer_id_addr_;  /* cached at CONNECT: needed for bond
+                                   * delete after the conn object is gone */
+static hid_ble_pair_ui_cb_t pair_ui_cb_ = NULL;
 static uint8_t protocol_mode_ = 1; /* 1 = report protocol */
 static uint8_t kbd_leds_ = 0;
 static uint8_t battery_level_ = 95;
@@ -478,8 +494,11 @@ static void start_advertising(void)
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     fields.appearance = 0x03C1; /* keyboard */
     fields.appearance_is_present = 1;
-    uint16_t uuids16[] = { 0x1812 };
-    fields.uuids16 = uuids16;
+    /* v0.4.18.74: Fix type bug — fields.uuids16 is const ble_uuid16_t*,
+     * not uint16_t*. The old code caused rotating garbage UUIDs
+     * (0x221B/0xCDD8) in the adv payload instead of 0x1812. */
+    static const ble_uuid16_t adv_uuids16[] = { BLE_UUID16_INIT(0x1812) };
+    fields.uuids16 = adv_uuids16;
     fields.num_uuids16 = 1;
     fields.uuids16_is_complete = 1;
     fields.name = (uint8_t *)s_device_name;
@@ -516,9 +535,27 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             conn_handle_ = event->connect.conn_handle;
             advertising_ = false; /* controller stops advertising on connect */
             ESP_LOGI(TAG, "connected, handle=%d", conn_handle_);
-            /* LED: celebration flash, then back to the idle heartbeat. */
-            led_clear_state(LED_STATE_BLE_ADVERTISING);
-            led_flash_green();
+            /* NCP-1 revB: Record whether a bond already exists for this peer
+             * BEFORE any SMP runs. This is the §6 discriminator between
+             * "fresh unauthenticated pairing" (prompt) and "reconnect of a
+             * previously approved bond" (silent). */
+            struct ble_gap_conn_desc d;
+            had_bond_at_connect_ = false;
+            conn_approved_ = false;
+            consent_pending_ = false;
+            hid_drop_warned_ = false;
+            if (ble_gap_conn_find(event->connect.conn_handle, &d) == 0) {
+                peer_id_addr_ = d.peer_id_addr;
+                struct ble_store_key_sec k;
+                struct ble_store_value_sec v;
+                memset(&k, 0, sizeof(k));
+                k.peer_addr = d.peer_id_addr;
+                had_bond_at_connect_ = (ble_store_read_peer_sec(&k, &v) == 0);
+            }
+            /* v0.4.18.73: Do NOT touch LEDs here. led_clear_state() uses
+             * portMAX_DELAY which blocks the NimBLE host task, causing SMP
+             * Pairing Requests to go unanswered → 30s timeout → disconnect.
+             * LED updates happen in ble_evt_task (async). */
             /* Ask the peer to pair/bond (Just Works). */
             ble_gap_security_initiate(conn_handle_);
             if (event_cb_) {
@@ -538,6 +575,20 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
          * connection: without this the peer sees a stuck button after
          * re-pairing. No report to send -- there is no peer right now. */
         mouse_buttons_ = 0;
+        /* NCP-1 revB: Dismiss any in-flight pairing prompt on disconnect.
+         * If consent was pending, the bond was written at key distribution
+         * but never approved — delete it or the §6 invariant breaks. */
+        if (consent_pending_) {
+            consent_pending_ = false;
+            ble_store_util_delete_peer(&peer_id_addr_);
+            ESP_LOGW(TAG, "consent never given: unapproved bond deleted");
+        }
+        conn_approved_ = false;
+        pair_waiting_ = false;
+        pair_gen_++;
+        if (pair_ui_cb_) {
+            pair_ui_cb_(pair_gen_, HID_BLE_PAIR_UI_DISMISS, 0);
+        }
         if (event_cb_) {
             event_cb_(false);
         }
@@ -554,7 +605,140 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_MTU:
         ESP_LOGI(TAG, "MTU updated: %d", event->mtu.value);
         break;
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+        /* v0.4.18.74: Root cause of the 30s BLE flap. When a peer we have
+         * a bond for (in NVS) sends a fresh Pairing Request (its side lost
+         * the bond), NimBLE raises this event and acts on our return value.
+         * Return 0 (the old default) = silently ignore the Pairing Request
+         * → BlueZ waits 30s (SMP timeout) → disconnect 0x13 → reconnect →
+         * infinite flap. The fix: delete our stale bond and return RETRY
+         * so the new pairing proceeds. MUST delete before RETRY: NimBLE
+         * re-raises this event until the bond is gone; RETRY without delete
+         * is an infinite loop in the host task. */
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0) {
+            ble_store_util_delete_peer(&desc.peer_id_addr);
+            ESP_LOGW(TAG, "repeat pairing: stale bond deleted, retrying");
+        }
+        return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
+    case BLE_GAP_EVENT_PASSKEY_ACTION: {
+        /* NCP-1 revB: Numeric Comparison pairing ceremony. This runs in the
+         * NimBLE host task — record state and queue to UI, never block. */
+        const struct ble_gap_passkey_params *p = &event->passkey.params;
+        switch (p->action) {
+        case BLE_SM_IOACT_NUMCMP:
+            /* NCP-1 revC defensive: unreachable with DISPLAY_ONLY (resp table
+             * row 0 has no NUMCMP). Kept functional so an io_cap change can't
+             * reopen the silent-default hole that caused the 30 s flap. */
+            pair_conn_    = event->passkey.conn_handle;
+            pair_gen_++;
+            pair_waiting_ = true;
+            ESP_LOGW(TAG, "pairing: unexpected NUMCMP with DISPLAY_ONLY io_cap");
+            if (pair_ui_cb_) {
+                /* Queue-only: the UI callback must not block. */
+                pair_ui_cb_(pair_gen_, HID_BLE_PAIR_UI_NUMCMP, p->numcmp);
+            } else {
+                /* No UI registered: secure default = reject. */
+                struct ble_sm_io io = {
+                    .action = BLE_SM_IOACT_NUMCMP,
+                    .numcmp_accept = 0,
+                };
+                ble_sm_inject_io(event->passkey.conn_handle, &io);
+                ESP_LOGW(TAG, "pairing rejected: no pairing UI available");
+            }
+            break;
+        case BLE_SM_IOACT_DISP: {
+            /* NCP-1 revC PRIMARY CEREMONY. Normative (§0): fresh random
+             * passkey on every event — never cached, never reused, never
+             * logged or mirrored. A failed attempt leaks the passkey to an
+             * active attacker; freshness keeps every attempt at 1e-6. */
+            uint32_t pk = esp_random() % 1000000u;
+            struct ble_sm_io io = {
+                .action = BLE_SM_IOACT_DISP,
+                .passkey = pk,
+            };
+            int rc = ble_sm_inject_io(event->passkey.conn_handle, &io);
+            if (rc != 0) {
+                ESP_LOGW(TAG, "passkey inject failed: %d", rc);
+                break;
+            }
+            pair_conn_ = event->passkey.conn_handle;
+            pair_gen_++;
+            pair_waiting_ = false;              /* nothing to answer locally */
+            ESP_LOGI(TAG, "pairing: passkey displayed (gen=%u)",
+                     (unsigned)pair_gen_);      /* never log pk itself */
+            if (pair_ui_cb_) {
+                pair_ui_cb_(pair_gen_, HID_BLE_PAIR_UI_PASSKEY, pk);
+            } else {
+                /* Headless: a passkey nobody can read is unpairable anyway;
+                 * terminate rather than leave a 30 s mystery window. */
+                ble_gap_terminate(event->passkey.conn_handle,
+                                  BLE_ERR_REM_USER_CONN_TERM);
+            }
+            break;
+        }
+        case BLE_SM_IOACT_INPUT: /* unreachable with DisplayYesNo in SC */
+        case BLE_SM_IOACT_OOB:   /* OOB never configured */
+        default:
+            ESP_LOGW(TAG, "pairing: unsupported io action %d — terminating",
+                     p->action);
+            ble_gap_terminate(event->passkey.conn_handle,
+                              BLE_ERR_REM_USER_CONN_TERM);
+            break;
+        }
+        return 0;
+    }
+    case BLE_GAP_EVENT_ENC_CHANGE: {
+        /* NCP-1 revB: Consent gate. Pairing just completed (or failed).
+         * Determine if the bond is authenticated (MITM ceremony happened),
+         * a previously-approved bond, or a fresh unauthenticated pairing
+         * that needs user consent. */
+        struct ble_gap_conn_desc d;
+        bool have = (ble_gap_conn_find(event->enc_change.conn_handle, &d) == 0);
+        pair_waiting_ = false;
+        pair_gen_++;
+        if (pair_ui_cb_) {
+            pair_ui_cb_(pair_gen_, HID_BLE_PAIR_UI_DISMISS, 0);
+        }
+
+        if (event->enc_change.status != 0 || !have || !d.sec_state.encrypted) {
+            ESP_LOGW(TAG, "encryption failed (status=%d)",
+                     event->enc_change.status);
+            return 0;
+        }
+        if (d.sec_state.authenticated) {
+            /* NC or passkey ceremony happened: authorized by construction. */
+            conn_approved_ = true;
+            ESP_LOGI(TAG, "encrypted, authenticated (MITM-protected)");
+        } else if (had_bond_at_connect_) {
+            /* Unauthenticated bond predating this connection. Invariant:
+             * such a bond only survives if the user approved it at creation,
+             * so reconnects are silent. */
+            conn_approved_ = true;
+            ESP_LOGI(TAG, "encrypted, unauthenticated (previously approved bond)");
+        } else {
+            /* Fresh Just Works pairing: park HID and ask the user. */
+            conn_approved_ = false;
+            consent_pending_ = true;
+            pair_conn_ = event->enc_change.conn_handle;
+            pair_gen_++;
+            ESP_LOGW(TAG, "encrypted, UNAUTHENTICATED fresh pairing: awaiting consent");
+            if (pair_ui_cb_) {
+                pair_ui_cb_(pair_gen_, HID_BLE_PAIR_UI_CONSENT, 0);
+            } else {
+                /* Headless: secure default — no screen, no consent, no bond. */
+                ble_store_util_delete_peer(&peer_id_addr_);
+                ble_gap_terminate(event->enc_change.conn_handle,
+                                  BLE_ERR_REM_USER_CONN_TERM);
+            }
+        }
+        return 0;
+    }
     default:
+        /* v0.4.18.74: Never silently ignore unknown GAP events again.
+         * This default cost days of debugging on the REPEAT_PAIRING bug. */
+        ESP_LOGI(TAG, "gap event %d (unhandled)", event->type);
         break;
     }
     return 0;
@@ -590,6 +774,16 @@ static esp_err_t notify_report(uint16_t chr_h, const uint16_t *sub,
                                const void *data, size_t len)
 {
     if (conn_handle_ == BLE_HS_CONN_HANDLE_NONE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* NCP-1 revB: HID TX gate. Until the connection is approved (NC ceremony
+     * completed, or consent granted for JW), drop reports. The peer holds an
+     * encrypted link that carries nothing. */
+    if (!conn_approved_) {
+        if (!hid_drop_warned_) {
+            ESP_LOGW(TAG, "HID report dropped: connection not approved");
+            hid_drop_warned_ = true;
+        }
         return ESP_ERR_INVALID_STATE;
     }
     if ((*sub & 0x0001) == 0) {
@@ -742,11 +936,13 @@ esp_err_t hid_ble_init(void)
 
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
-    /* Just-Works bonding, persisted in NVS. */
+    /* NCP-1 revC: Passkey Entry with Watcher as display (primary ceremony).
+     * DISPLAY_ONLY + sm_mitm=1 → resp table row 0: KeyboardDisplay hosts
+     * get DISP (we show 6 digits, user types on host). */
     ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_sc = 1;
-    ble_hs_cfg.sm_mitm = 0;
-    ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
+    ble_hs_cfg.sm_mitm = 1;
+    ble_hs_cfg.sm_io_cap = BLE_HS_IO_DISPLAY_ONLY;
     ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC;
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC;
 
@@ -779,6 +975,10 @@ esp_err_t hid_ble_init(void)
     ble_hs_cfg.store_read_cb = ble_store_config_read;
     ble_hs_cfg.store_write_cb = ble_store_config_write;
     ble_hs_cfg.store_delete_cb = ble_store_config_delete;
+    /* v0.4.18.74: Handle full bond store by deleting oldest peer (standard
+     * NimBLE pattern). Without this, a full store fails key-exchange writes
+     * mid-pairing — a different way to not finish pairing. */
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
     nimble_port_freertos_init(host_task);
 
     /* Firmware-side BLE keepalive task (always runs on its interval).
@@ -882,6 +1082,66 @@ esp_err_t hid_ble_unbond(void)
 void hid_ble_set_event_cb(hid_ble_event_cb_t cb)
 {
     event_cb_ = cb;
+}
+
+void hid_ble_set_pair_ui_cb(hid_ble_pair_ui_cb_t cb)
+{
+    pair_ui_cb_ = cb;
+}
+
+esp_err_t hid_ble_pair_confirm(uint32_t gen, bool accept)
+{
+    /* NCP-1 revB: Dispatch on which prompt is live. */
+    if (pair_waiting_ && gen == pair_gen_) {
+        /* Numeric Comparison: inject the user's decision into SMP. */
+        pair_waiting_ = false;
+        struct ble_sm_io io = {
+            .action = BLE_SM_IOACT_NUMCMP,
+            .numcmp_accept = accept ? 1 : 0,
+        };
+        int rc = ble_sm_inject_io(pair_conn_, &io);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "pair_confirm(NC): inject_io failed: %d", rc);
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "pair_confirm(NC): %s (gen=%u)",
+                 accept ? "accepted" : "rejected", (unsigned)gen);
+        return ESP_OK;
+    }
+    if (consent_pending_ && gen == pair_gen_) {
+        /* [revB] Consent gate: accept keeps the bond (approval = keeping);
+         * reject deletes the just-created bond and drops the link. */
+        consent_pending_ = false;
+        if (accept) {
+            conn_approved_ = true;
+            ESP_LOGI(TAG, "consent: approved (gen=%u)", (unsigned)gen);
+        } else {
+            ble_store_util_delete_peer(&peer_id_addr_);
+            ble_gap_terminate(pair_conn_, BLE_ERR_REM_USER_CONN_TERM);
+            ESP_LOGW(TAG, "consent: rejected, bond deleted (gen=%u)",
+                     (unsigned)gen);
+        }
+        return ESP_OK;
+    }
+    /* Stale gen or nothing pending: late tap after timeout/disconnect.
+     * Normal, ignore silently. */
+    return ESP_ERR_INVALID_STATE;
+}
+
+bool hid_ble_conn_approved(void)
+{
+    return conn_approved_;
+}
+
+void hid_ble_abort_pairing(void)
+{
+    /* Terminate the connection. The DISCONNECT handler cleans up pairing
+     * state (deletes unapproved bond if consent was pending) and dismisses
+     * the modal via the UI callback. */
+    if (conn_handle_ != BLE_HS_CONN_HANDLE_NONE) {
+        ESP_LOGW(TAG, "pairing aborted by user");
+        ble_gap_terminate(conn_handle_, BLE_ERR_REM_USER_CONN_TERM);
+    }
 }
 
 esp_err_t hid_ble_type_text(const char *text)

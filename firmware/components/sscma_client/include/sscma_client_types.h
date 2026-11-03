@@ -171,6 +171,11 @@ struct sscma_client_t
     } rx_buffer, tx_buffer;    /* !< RX and TX buffer */
     QueueHandle_t reply_queue; /* !< Queue for reply message */
     List_t *request_list;      /* !< Request list */
+    /* v0.4.14 (P1): set while a bulk transfer (io->read_bulk) holds the
+     * bus. The process task treats it as a hint and skips AT polling
+     * instead of blocking on the io lock; the io lock itself is the real
+     * serialization. Written by the bulk caller, read by the process task. */
+    volatile bool bulk_active;
 };
 
 #ifdef __cplusplus

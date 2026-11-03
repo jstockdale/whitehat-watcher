@@ -324,7 +324,10 @@ static void input_task(void *arg)
         int detents = wheel_take_delta();
         if (detents != 0) {
             TRACE("wheel %+d detent(s)", detents);
-            if (display_message_visible()) {
+            if (display_pair_visible()) {
+                /* NCP-1: Pairing modal has input priority: wheel selects button. */
+                display_pair_wheel_nav(detents);
+            } else if (display_message_visible()) {
                 /* Message overlay has input priority: wheel scrolls it. */
                 display_message_scroll(detents);
             } else if (btn_down && !ptt_button_claimed()) {
@@ -404,15 +407,29 @@ static void input_task(void *arg)
                 TRACE("wheel-click down");
             } else {
                 TRACE("wheel-click up");
-                /* Timer mode works on-device, so its short-press bypasses
-                 * the BLE-connected gate. Suppress when PTT claimed the
-                 * button or when push+scroll already cycled the mode. */
-                if (!btn_mode_cycled && !ptt_button_claimed() &&
+                /* NCP-1: Pairing modal intercepts clicks: confirm selected button. */
+                if (display_pair_visible()) {
+                    display_pair_wheel_click();
+                } else if (!btn_mode_cycled && !ptt_button_claimed() &&
                     (emit || mode_get() == MODE_TIMER)) {
                     mode_short_press();
                 }
                 btn_mode_cycled = false;
             }
+        }
+
+        /* NCP-1: Long-press (1.5s) on wheel button while pairing modal is
+         * visible aborts the pairing. Checked every loop while held;
+         * fires once per press via the aborted latch. */
+        static bool pair_aborted_ = false;
+        if (display_pair_visible() && btn_down && !pair_aborted_ &&
+            (t - btn_edge_at > 1500)) {
+            pair_aborted_ = true;
+            ESP_LOGW("input", "pairing aborted via wheel long-press");
+            hid_ble_abort_pairing();
+        }
+        if (!btn_down) {
+            pair_aborted_ = false;
         }
 
         /* ---- timer readout: 10 Hz refresh while running in timer mode ---- */

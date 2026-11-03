@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Auto-capture snaptest images when bench is active.
+
+Collects snaptest_chunk messages and reassembles them into JPEG files.
+Only active when the BENCH_ACTIVE flag file exists — prevents filling
+disk with images when we're not on the bench.
+
+Usage: touch BENCH_ACTIVE to enable, rm BENCH_ACTIVE to disable.
+"""
+
+import base64
+import json
+import os
+import time
+
+BRIDGE_DIR = os.path.dirname(os.path.abspath(__file__))
+BENCH_FLAG = os.path.join(BRIDGE_DIR, "BENCH_ACTIVE")
+SNAPSHOT_DIR = os.path.join(BRIDGE_DIR, "snapshots")
+# v0.4.18.86: Save raw chunks for debugging/reassembly (John 2026-10-08)
+# The telemetry log truncates base64 to 160 chars, so we need the full
+# chunks persisted separately.
+CHUNK_DIR = os.path.join(BRIDGE_DIR, "chunks")
+
+# In-progress reassembly: id -> {chunks: dict, total: int}
+_pending = {}
+
+
+def is_bench_active() -> bool:
+    """Check if bench work is active."""
+    return os.path.exists(BENCH_FLAG)
+
+
+def handle_snaptest_message(raw: str) -> str | None:
+    """Try to parse a raw message as snaptest data. Returns image path or None."""
+    if not is_bench_active():
+        return None
+    
+    try:
+        msg = json.loads(raw)
+    except Exception:
+        return None
+    
+    if not isinstance(msg, dict):
+        return None
+    
+    t = msg.get("t")
+    if t == "snaptest_chunk":
+        return _feed_chunk(msg)
+    elif t == "snaptest_image":
+        # Image complete notification — chunks should already be assembled
+        return None
+    
+    return None
+
+
+def _save_streaming_png(img_id) -> str | None:
+    """Save a completed streaming PNG. Returns path or None."""
+    pending = _pending.get(img_id)
+    if not pending:
+        return None
+    try:
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        # v0.4.18.88 (2026-10-08): Decode each chunk's base64 SEPARATELY,
+        # then concatenate the decoded bytes. Each chunk is independently
+        # base64-encoded with its own padding; joining the b64 strings then
+        # decoding once fails (atob throws, Python silently stops at first =).
+        chunks_dict = pending.get("chunks", {})
+        if not chunks_dict:
+            return None
+        seqs = sorted(chunks_dict.keys())
+        # Verify no gaps
+        if seqs != list(range(seqs[0], seqs[-1] + 1)):
+            return None
+        parts = []
+        for s in seqs:
+            parts.append(base64.b64decode(chunks_dict[s]))
+        img_data = b"".join(parts)
+
+        # Verify PNG signature
+        if not img_data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return None
+
+        # Sanity: a real 1296x972 PNG is >100KB. If we have less than 10KB,
+        # the IEND detection was a false positive — don't save, keep waiting.
+        if len(img_data) < 10240:
+            return None
+
+        # Verify IEND trailer
+        iend_trailer = bytes([0,0,0,0, 0x49,0x45,0x4E,0x44, 0xAE,0x42,0x60,0x82])
+        if not img_data.endswith(iend_trailer):
+            return None
+
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(SNAPSHOT_DIR, f"snap-{timestamp}-{img_id}.png")
+        with open(path, "wb") as f:
+            f.write(img_data)
+
+        del _pending[img_id]
+        return path
+    except Exception as e:
+        # Log the error instead of silently swallowing (John 2026-10-08)
+        import traceback
+        print(f"[snaptest] _save_streaming_png failed for id={img_id}: {e}")
+        traceback.print_exc()
+        return None
+
+
+def _feed_chunk(msg: dict) -> str | None:
+    """Feed a chunk into the reassembler. Returns path when complete."""
+    img_id = msg.get("id", 0)
+    seq = msg.get("seq", 0)
+    total = msg.get("total", 0)
+    b64_data = msg.get("b64", "")
+    is_last = msg.get("last", False)
+
+    # v0.4.18.86: Streaming mode (total=-1) for PNG. Accumulate chunks in
+    # order until we see the PNG IEND marker.
+    streaming = (total is not None and total < 0)
+
+    # v0.4.18.86 (John 2026-10-08): Persist raw chunks to disk. The telemetry
+    # log truncates base64, so we save full chunks here for reassembly/debug.
+    try:
+        os.makedirs(CHUNK_DIR, exist_ok=True)
+        chunk_path = os.path.join(CHUNK_DIR, f"chunk-{img_id}-{seq}.b64")
+        with open(chunk_path, "w") as f:
+            f.write(b64_data)
+    except Exception:
+        pass
+
+    if img_id not in _pending:
+        _pending[img_id] = {"chunks": {}, "total": total, "streaming": streaming, "ordered": []}
+
+    _pending[img_id]["chunks"][seq] = b64_data
+    if streaming:
+        # Keep ordered list for streaming (seq should be sequential)
+        _pending[img_id]["ordered"].append(b64_data)
+    _pending[img_id]["total"] = total
+
+    # Check if complete
+    pending = _pending[img_id]
+    if streaming:
+        # Streaming: check if the latest chunk ENDS with the PNG IEND chunk.
+        # IEND is always the last 12 bytes: 00 00 00 00 49 45 4E 44 AE 42 60 82
+        # (Don't just check for b"IEND" anywhere — those bytes can appear by
+        # chance in compressed IDAT data!)
+        try:
+            latest_raw = base64.b64decode(b64_data)
+            # IEND chunk trailer (last 12 bytes of PNG)
+            if latest_raw.endswith(bytes([0,0,0,0, 0x49,0x45,0x4E,0x44, 0xAE,0x42,0x60,0x82])):
+                return _save_streaming_png(img_id)
+        except Exception as e:
+            print(f"[snaptest] IEND check failed for id={img_id} seq={seq}: {e}")
+        return None
+
+    if len(pending["chunks"]) >= total or is_last:
+        # Reassemble in order
+        try:
+            os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+            parts = []
+            for i in range(total):
+                if i in pending["chunks"]:
+                    parts.append(pending["chunks"][i])
+                else:
+                    # Missing chunk
+                    return None
+            
+            b64_combined = "".join(parts)
+            img_data = base64.b64decode(b64_combined)
+            
+            # Verify JPEG
+            if not img_data.startswith(b"\xff\xd8"):
+                return None
+            
+            # Trim at EOI if needed
+            eoi = img_data.rfind(b"\xff\xd9")
+            if eoi > 0:
+                img_data = img_data[:eoi+2]
+            
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            path = os.path.join(SNAPSHOT_DIR, f"snap-{timestamp}-{img_id}.jpg")
+            with open(path, "wb") as f:
+                f.write(img_data)
+            
+            del _pending[img_id]
+            return path
+            
+        except Exception:
+            return None
+    
+    return None

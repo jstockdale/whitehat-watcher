@@ -35,7 +35,10 @@ static void _uart_dma_recv(void*) {
     if (!_is_opened || !_rb_rx || !_rx_buf || !_uart) {
         return;
     }
-    SCB_CleanDCache_by_Addr(_rx_buf, 1);
+    /* v0.4.13: INVALIDATE (not clean) the RX byte — DMA-write buffer, see
+     * ma_transport_console.cpp for the full explanation. The old Clean
+     * silently swallowed every UART RX byte (AT server never saw '\r'). */
+    SCB_InvalidateDCache_by_Addr(_rx_buf, 1);
     _rb_rx->push(_rx_buf, 1);
     _uart->uart_read_udma(_rx_buf, 1, reinterpret_cast<void*>(_uart_dma_recv));
 }
@@ -93,7 +96,14 @@ ma_err_t Serial::init(const void* config) {
     }
 
     if (_rb_tx == nullptr) {
+#ifdef CAPTURE_ONLY_MODE
+        /* v0.4.6: 48 KiB -> 16 KiB in capture-only mode. The serial TX ring
+         * only carries AT responses (a few KB max); the reclaimed 32 KiB
+         * helps the 1296x972 RAW8 frame allocation fit the heap. */
+        _rb_tx = new SPSCRingBuffer<char>(16 * 1024);
+#else
         _rb_tx = new SPSCRingBuffer<char>(48 * 1024);
+#endif
     }
 
     if (!_rx_buf || !_tx_buf || !_rb_rx || !_rb_tx) {
@@ -136,12 +146,14 @@ void Serial::deInit() {
     }
 
     if (_rx_buf) {
-        delete[] _rx_buf;
+        /* v0.4.12: allocated with aligned new[] — pair with the aligned
+         * delete (see ma_device.cpp). */
+        ::operator delete[](_rx_buf, std::align_val_t{32});
         _rx_buf = nullptr;
     }
 
     if (_tx_buf) {
-        delete[] _tx_buf;
+        ::operator delete[](_tx_buf, std::align_val_t{32});
         _tx_buf = nullptr;
     }
 

@@ -1,0 +1,106 @@
+# DRAFT — prepared 2026-11-02 by proactive research, NOT applied.
+# Watcher 0.4.22 candidate: bounded-blocking ring push for the link_send
+# data path (fix for the 0.4.21 verification run-1 abort).
+#
+# Evidence (2026-11-02, side-chat bench session + telemetry.log):
+# run 1 on 0.4.21 streamed clean at ~0.95s/chunk, then at 22:58:26 UTC
+# chunk 42 failed: "link_send: ring push failed — line dropped" ->
+# "snaptest: chunk 42 send failed, ABORTING PNG transfer". The ring had
+# room (the 0.4.21 headroom wait passed, log_laps stayed 0); the push
+# itself uses ring_push_nb, whose xSemaphoreTake(log_lock_, 0) lost the
+# race to an ordinary log writer. Cross-check: heartbeat log_dropped
+# went 544 (22:04 UTC) -> 11,679 (23:02 UTC); the ~11,135 delta matches
+# one full chunk line (slen+1) counted once by the 0.4.21 code — the
+# counters independently confirm exactly one data line was dropped.
+#
+# Fix shape (matches the direction already proposed to John in the side
+# chat; his decision was still pending when this draft was prepared):
+# parameterize the ring push with a wait timeout. The vprintf logging
+# path keeps the 0-tick try-lock (a log line must never block its
+# caller); link_send — the data path for replies and PNG chunks — waits
+# up to 100ms, the same bound link_send already uses for tx_lock_.
+# Holders of log_lock_ are bounded byte-copies only: <=256B in
+# log_capture_vprintf and console_tx_task, the full 32KB ring in the
+# dbg log-dump handler (which releases before any link work), and the
+# push itself; chunk pushes cannot contend with each other because
+# link_send is serialized by tx_lock_. log_lock_ is a leaf here — no
+# holder takes tx_lock_ while holding it — so the wait cannot invert
+# lock order. On timeout the behavior is exactly today's: counted in
+# log_dropped_, ESP_FAIL returned, chunk senders abort loudly.
+#
+# Also bumps FW_VERSION 0.4.21 -> 0.4.22 (John's rule: a new binary
+# gets a new version number; never two artifacts with one version).
+#
+# NOT done by this draft: no build, no flash — both need John's go in
+# the bench session, as always. Verification after a future flash:
+# restart the five-consecutive-bridged-snaptest bar on 0.4.22 (run 1
+# on 0.4.21 is evidence, not a sample carried over), judged by per-run
+# log_dropped deltas bracketing each run with log_laps delta = 0.
+# The bridge reassembler splice patch (mqtt-bridge folder) is a
+# separate decision and is not touched by this draft.
+# Validation: the diff below passes git apply --check against the live
+# working tree (checked 2026-11-02 ~23:05 UTC); live sources untouched.
+--- a/firmware/components/link/link.c
++++ b/firmware/components/link/link.c
+@@ -173,13 +173,22 @@
+ /* v0.4.18.70 (Claude F1/F2): Non-blocking ring push. Always writes
+  * (overwrite-oldest for retention), advances head, saturates valid,
+  * increments log_written_. Returns true if written, false if lock unavailable.
+- * Caller must hold no locks. */
+-static bool ring_push_nb(const char *data, size_t len)
++ * Caller must hold no locks.
++ * v0.4.22 (chunk-loss RCA run 1, 2026-11-02): wait_ticks parameter.
++ * The 0-tick try-lock is right for the vprintf path (a log line must
++ * never block its caller) but wrong for link_send: 0.4.21 verification
++ * run 1 aborted at chunk 42 when a must-not-drop 11KB chunk line lost
++ * the 0-tick race to an ordinary log writer. log_lock_ is a leaf
++ * (holders only byte-copy; nobody takes tx_lock_ while holding it),
++ * so a bounded wait on the data path cannot invert lock order. On
++ * timeout the push fails exactly as before: counted by the caller,
++ * who aborts loudly instead of shipping a holed stream. */
++static bool ring_push_wait(const char *data, size_t len, TickType_t wait_ticks)
+ {
+     if (!log_ring_ || !log_lock_ || !data || len == 0) {
+         return false;
+     }
+-    if (xSemaphoreTake(log_lock_, 0) != pdTRUE) {
++    if (xSemaphoreTake(log_lock_, wait_ticks) != pdTRUE) {
+         return false;
+     }
+     for (size_t i = 0; i < len; i++) {
+@@ -196,6 +205,12 @@
+     return true;
+ }
+ 
++/* 0-tick wrapper: the logging path (log_capture_vprintf) never blocks. */
++static bool ring_push_nb(const char *data, size_t len)
++{
++    return ring_push_wait(data, len, 0);
++}
++
+ /* v0.4.18.81: Ring backlog for PNG chunk flow control (John 2026-10-08).
+  * Returns 0-100 (percent of ring size backed up). Measures the actual
+  * TX backlog (log_written_ - tx_read_), NOT log_valid_ which is retained
+@@ -455,7 +470,10 @@
+             memcpy(line, s, slen);
+             line[slen] = '\n';
+             line[slen + 1] = '\0';
+-            if (!ring_push_nb(line, slen + 1)) {
++            /* v0.4.22: bounded-blocking push -- data lines wait out
++             * routine log contention (100ms, the same bound this
++             * function already uses for tx_lock_) instead of dropping. */
++            if (!ring_push_wait(line, slen + 1, pdMS_TO_TICKS(100))) {
+                 /* v0.4.21 (chunk-loss RCA 2026-11-02): 0-tick lock miss
+                  * dropped the whole line — previously invisible (the old
+                  * comment claimed ring_push_nb counted it; it doesn't).
+--- a/firmware/main/main.c
++++ b/firmware/main/main.c
+@@ -32,7 +32,7 @@
+ #include "wakeword.h"
+ 
+ static const char *TAG = "main";
+-#define FW_VERSION "0.4.21"
++#define FW_VERSION "0.4.22"
+ 
+ /* v0.4.18.72 (Claude btmon 2026-10-08): BLE GAP callbacks run in the NimBLE
+  * host task context. Doing I/O there (display, link_send, MQTT) blocks the

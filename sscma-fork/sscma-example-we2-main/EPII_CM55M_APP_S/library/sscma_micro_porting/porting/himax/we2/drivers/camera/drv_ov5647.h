@@ -72,7 +72,7 @@ typedef struct {
 ma_err_t drv_ov5647_raw_dump(drv_raw_dump_result_t* out);
 
 #ifdef CAPTURE_ONLY_MODE
-/* v0.4.4 experimental: full-frame raw capture.
+/* v0.4.5: full-frame raw capture.
  * drv_ov5647_set_raw_buffer() registers a caller-allocated buffer for raw
  * capture. drv_ov5647_raw_dump() uses it instead of the 600KB YUV buffer
  * when registered. drv_ov5647_init_raw() configures the sensor/INP for
@@ -80,6 +80,14 @@ ma_err_t drv_ov5647_raw_dump(drv_raw_dump_result_t* out);
 void     drv_ov5647_set_raw_buffer(uint8_t* buf, size_t size, uint8_t bits);
 void     drv_ov5647_clear_raw_buffer(void);
 ma_err_t drv_ov5647_init_raw(uint16_t width, uint16_t height, uint8_t bits);
+/* v0.4.15 (P4/P5): full-sensor-resolution raw init. Programs the OV5647
+ * for 2592x1944 output and captures the (x, y, w, h) window 1:1 via the
+ * INP crop. drv_ov5647_recrop_fullres() moves the window without a sensor
+ * re-init (strip capture). drv_ov5647_raw_dump() is unchanged — it uses
+ * _frame.width/_frame.height, which these functions set. */
+ma_err_t drv_ov5647_init_raw_fullres(uint16_t crop_x, uint16_t crop_y, uint16_t crop_w, uint16_t crop_h,
+                                     uint8_t bits);
+ma_err_t drv_ov5647_recrop_fullres(uint16_t crop_x, uint16_t crop_y, uint16_t crop_w, uint16_t crop_h);
 #endif
 
 #ifdef __cplusplus

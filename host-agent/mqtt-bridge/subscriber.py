@@ -16,9 +16,11 @@ Topics (contract agreed 2026-09-23):
     watcher/command    Muse -> console : {"id","cmd"}  (downlink, later)
 """
 
+import atexit
 import base64
 import json
 import os
+import signal
 import ssl
 import sys
 import threading
@@ -131,6 +133,18 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
         sys.exit(1)
 
 
+def on_disconnect(client, userdata, flags, reason_code, properties=None):
+    # Diagnostic (2026-10-04): the bridge died silently 3x today with no
+    # traceback. Log every broker-side disconnect so the next death leaves
+    # evidence in subscriber.log. paho auto-reconnects unless the client
+    # state is DISCONNECTING/DISCONNECTED (i.e. disconnect() was called).
+    try:
+        rc = reason_code.value if hasattr(reason_code, "value") else reason_code
+    except Exception:
+        rc = reason_code
+    log_line(f"mqtt disconnected: rc={rc}")
+
+
 def on_message(client, userdata, msg):
     try:
         payload = json.loads(msg.payload.decode("utf-8", "replace"))
@@ -140,12 +154,15 @@ def on_message(client, userdata, msg):
         events = payload.get("events", [])
         fw = payload.get("fw", "?")
         log_line(f"[telemetry] fw={fw} events={len(events)}")
-        for e in events[-5:]:
+        # v2026-10-05: log ALL events, not just last 5. The [-5:] slice was
+        # silently dropping Himax DIAG lines during bulk transfers (batches
+        # of 8-9 events). John: keep everything until Muse accesses it.
+        for e in events:
             raw = str(e.get("raw", ""))
             if '"sealed_chunk"' in raw[:60]:
                 raw = "[sealed_chunk]"  # never log ciphertext into telemetry.log
             else:
-                raw = raw[:160].replace("\n", " ")
+                raw = raw[:255].replace("\n", " ")
             log_line(f"    [{e.get('level','?')}/{e.get('kind','?')}] {raw}")
         # PTT audio arrives as raw device JSON inside telemetry events
         # (current console); scan all events, not just the last 5.
@@ -296,6 +313,29 @@ def main() -> None:
     if not PASS:
         print("MQTT_PASS is not set", file=sys.stderr)
         sys.exit(2)
+    # Exit diagnostics (prepared 2026-10-16): 109 of 150 rc=128
+    # disconnects since Oct 5 are the dying process's last log line,
+    # with zero tracebacks, zero "loop_forever returned" lines and
+    # zero "connect failed" lines in subscriber.log. Log every
+    # remaining way out so the next death names its cause: a signal
+    # (external kill), SystemExit, or atexit with neither (clean
+    # interpreter teardown).
+    def _log_exit(reason: str) -> None:
+        try:
+            log_line(f"[exit-diag] process exiting: {reason}")
+        except Exception:
+            pass
+
+    def _on_signal(signum, frame):
+        _log_exit(f"signal {signal.Signals(signum).name} ({signum})")
+        # Restore the default disposition and re-deliver, so exit
+        # semantics and the status the watchdog sees do not change.
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(_sig, _on_signal)
+    atexit.register(_log_exit, "atexit (no signal, no exception logged)")
     _tel_keys_init()  # D5b: load telemetry seed (fp logged, seed never)
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
                          client_id="muse-bridge-1")
@@ -303,6 +343,7 @@ def main() -> None:
     client.tls_set(cert_reqs=ssl.CERT_REQUIRED,
                    tls_version=ssl.PROTOCOL_TLS_CLIENT)
     client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
     client.on_message = on_message
     log_line(f"connecting to {HOST}:{PORT} ...")
     client.connect(HOST, PORT, keepalive=30)
@@ -313,9 +354,18 @@ def main() -> None:
     log_line(f"[bridge] status+ping on {BRIDGE_TOPIC}; "
              f"idle check-in every {IDLE_CHECKIN_INTERVAL}s")
     try:
-        client.loop_forever()
-    except KeyboardInterrupt:
-        log_line("stopped")
+        rc = client.loop_forever()
+        # loop_forever() returning (rather than raising) means the main
+        # thread is exiting and the process will die with no traceback —
+        # log it so a silent death becomes a diagnosed one.
+        log_line(f"loop_forever returned rc={rc}; bridge exiting")
+    except BaseException as e:
+        # BaseException, not Exception: also catches SystemExit (e.g.
+        # a sys.exit() inside a paho callback) and KeyboardInterrupt,
+        # both of which currently leave no line in the log at all.
+        log_line(f"loop_forever raised {type(e).__name__}: {e!r}; "
+                 f"bridge exiting")
+        raise
 
 
 if __name__ == "__main__":

@@ -75,6 +75,26 @@ struct sscma_client_io_t
      *          - ESP_OK
      */
     esp_err_t (*flush)(sscma_client_io_t *io);
+
+    /**
+     * @brief Bulk-read `size` bytes in one bus transaction sequence
+     *
+     * Optional fast path for large transfers (e.g. Himax SPI frame dumps).
+     * The transport holds its bus lock for the whole transfer and must not
+     * interleave AT traffic. NULL = not supported; the ops layer falls back
+     * to the chunked available()/read() loop.
+     *
+     * @param[in] io SCCMA client IO handle
+     * @param[in] data Destination buffer
+     * @param[in] size Bytes to transfer
+     * @return
+     *          - ESP_ERR_INVALID_ARG   if parameter is invalid
+     *          - ESP_ERR_NOT_SUPPORTED if bulk read is not supported
+     *          - ESP_ERR_INVALID_CRC   on checksum mismatch
+     *          - ESP_ERR_TIMEOUT       on transfer timeout
+     *          - ESP_OK                on success
+     */
+    esp_err_t (*read_bulk)(sscma_client_io_t *io, void *data, size_t size);
 };
 
 #ifdef __cplusplus

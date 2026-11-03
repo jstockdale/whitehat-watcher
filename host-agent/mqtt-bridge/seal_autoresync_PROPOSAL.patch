@@ -1,0 +1,124 @@
+PROPOSAL (not applied) — auto-resync the host seal counter from the
+device's reported floor before sealing. For John's approval.
+Tested: applies cleanly to seal_client.py; new logic unit-tested
+(resync-up, throttle, lower-floor no-op, anti-oracle refusal, missing
+log no-op) against a temp HOME — the real ~/.ssh/watcher_seal_ctr
+was not touched.
+
+Problem (verified 2026-10-05):
+  The S3 re-verifies every sealed envelope itself (seal_dev_verify=true)
+  and ratchets its accept floor on every boot:
+      floor = last_persisted_high_water + 32        (seal_dev.c:966, D4)
+  Every S3 reboot/flash during bench work can therefore push the floor up
+  to 32 past the host's persisted counter (~/.ssh/watcher_seal_ctr).
+  The host has a documented manual recovery (`seal_client.py --resync
+  <floor>`) but nothing runs it, so each incident recovered only by
+  "eating loud REPLAY drops walking past it" (seal_client.py docstring):
+  every rejected attempt still increments the host counter by 1.
+  John reported this three times in one session (06:35, 09:01, 09:43 UTC);
+  telemetry.log shows e.g. "SEAL: REPLAY ctr 24196 <= 24225 from muse-01
+  - DROPPED" (2026-10-05 09:51:38).
+
+Fix: a pre-send guard in seal_client.seal_command() that reads the most
+recent seal_floor from the bridge telemetry log (the device reports it in
+every heartbeat; link.c:581) and resyncs when the floor has run past our
+counter. Safety properties:
+  - resync_counter() only ever RAISES the counter (max(own, floor));
+    monotonicity is preserved, so this can never cause a REPLAY itself.
+  - The existing anti-oracle cap (refuse floor > own + 2^20) is kept: a
+    corrupt/stale log line can at worst no-op, never burn counter space.
+  - A stale or missing telemetry.log yields no floor -> no-op.
+  - Check is throttled to once per 60s so per-chunk flash sealing
+    (474 sealed commands per transfer) doesn't re-scan the log each time.
+  - Known limitation: the heartbeat reports the BOOT floor (seal_dev_floor
+    is set once at boot, seal_dev.c:966); the live reject threshold is the
+    runtime high-water, which can be higher. Resyncing to the boot floor
+    closes the common post-reboot gap; any residual gap still self-heals
+    by walking, as today.
+
+Apply from host-agent/mqtt-bridge/ with:  git apply seal_autoresync_PROPOSAL.diff
+(The diff below is also saved separately as seal_autoresync_PROPOSAL.diff.)
+
+=================== DIFF (also in seal_autoresync_PROPOSAL.diff) ===================
+--- a/seal_client.py
++++ b/seal_client.py
+@@ -23,6 +23,7 @@
+ import base64
+ import json
+ import os
++import re
+ import stat
+ import sys
+ import time
+@@ -38,6 +39,10 @@
+ 
+ COMMANDER_ID = "muse-01"
+ 
++# Throttle for the pre-send floor check (unix seconds, module-local).
++_last_floor_check = 0.0
++_FLOOR_CHECK_EVERY_S = 60.0
++
+ 
+ def load_signing_key():
+     with open(SEED_PATH) as f:
+@@ -91,10 +96,60 @@
+     return new
+ 
+ 
++
++def latest_reported_floor():
++    """Most recent seal_floor from the bridge telemetry log.
++
++    The device reports its (boot) floor in every heartbeat
++    (link.c:581 -> seal_dev_floor()). Returns None when the log is
++    missing/unreadable or carries no floor. This is a lower bound on
++    the live accept threshold, never an overestimate that could hurt.
++    """
++    log = os.path.join(os.path.dirname(os.path.abspath(__file__)),
++                       "telemetry.log")
++    try:
++        with open(log, "rb") as f:
++            f.seek(0, os.SEEK_END)
++            size = f.tell()
++            # Heartbeats land every few seconds; the last 64KB always
++            # covers several of them.
++            f.seek(max(0, size - 65536))
++            tail = f.read().decode("utf-8", "replace")
++    except OSError:
++        return None
++    ms = re.findall(r'"seal_floor":(\d+)', tail)
++    return int(ms[-1]) if ms else None
++
++
++def ensure_synced():
++    """Pre-send guard: resync when the device floor ran past our counter.
++
++    After a device reboot the floor ratchets to stored_high_water + 32
++    (D4), which can exceed our persisted counter. Sealing from the stale
++    counter would then eat loud REPLAY drops walking past it; resyncing
++    first skips that. Only ever raises the counter; the anti-oracle cap
++    in resync_counter() still applies. Throttled to once per minute.
++    """
++    global _last_floor_check
++    now = time.time()
++    if now - _last_floor_check < _FLOOR_CHECK_EVERY_S:
++        return
++    _last_floor_check = now
++    floor = latest_reported_floor()
++    if floor is None:
++        return
++    if floor > read_counter():
++        try:
++            resync_counter(floor)
++        except ValueError:
++            pass  # anti-oracle refusal: fall through to the normal path
++
++
+ def seal_command(cmd_id, cmd, topic="watcher/command"):
+     """Seal {"id": cmd_id, "cmd": cmd} -> {"sealed": base64_envelope}."""
+     body = json.dumps({"id": cmd_id, "cmd": cmd},
+                       separators=(",", ":")).encode()
++    ensure_synced()
+     ctr = next_counter()
+     ts_ms = int(time.time() * 1000)
+     env = mqs.seal_control(topic, COMMANDER_ID, ctr, ts_ms, body,

@@ -49,6 +49,10 @@
 #define EVENT_MQTT       "MQTT"
 #define EVENT_SUPERVISOR "SUPERVISOR"
 #define EVENT_INIT       "INIT@STAT"
+/* Connection-evidence prefix: the Himax WE2 firmware emits INIT@SENSOR,
+ * INIT@MODEL, INIT@ALGORITHM and INIT@TRIGGER at boot but never INIT@STAT.
+ * Any INIT@* event proves the Himax is alive and its event path works. */
+#define EVENT_INIT_PREFIX "INIT@"
 
 #define LOG_AT  "AT"
 #define LOG_LOG "LOG"

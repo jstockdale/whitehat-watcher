@@ -22,4 +22,16 @@ class Console final : public Transport {
 
 }  // namespace ma
 
+/* v0.4.20.7: Synchronized direct-UART print. Waits for in-flight Console TX
+ * DMA to drain, then writes directly to the UART. Use for boot-time DIAG
+ * lines that must not interleave with AT JSON responses (which use DMA).
+ * Declared extern "C" for use from C and C++ TUs. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void ma_console_print_sync(const char* str);
+#ifdef __cplusplus
+}
+#endif
+
 #endif

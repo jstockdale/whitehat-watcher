@@ -41,7 +41,21 @@ extern "C" {
 
 int app_main(void) {
     puts("Build date: " __DATE__ " " __TIME__);
+    /* v0.4.12 DIAG: heap baseline BEFORE any task/allocation. v0.4.11 proved
+     * the FreeRTOS heap is healthy here (1,461,784 B) while boot still threw
+     * std::bad_alloc — the thrower was libstdc++'s default ALIGNED operator
+     * new routing to newlib's 16 KiB _sbrk heap. Fixed in v0.4.12 by routing
+     * aligned new/delete to pvPortMalloc (ma_device.cpp). If this line
+     * prints and boot proceeds past it, the fix is confirmed. */
+    printf("DIAG v0.4.15: heap free at app_main: %lu bytes\n",
+           (unsigned long)xPortGetFreeHeapSize());
+    #ifdef CAPTURE_ONLY_MODE
+    /* v0.4.6.2: 16KB stack sufficient for AT server only (no TFLM inference).
+     * Frees 64KB for 1296x972 RAW8 capture buffer. */
+    if (xTaskCreate(__task, "__task", 4096, NULL, 3, NULL) != pdPASS) {
+#else
     if (xTaskCreate(__task, "__task", 20480, NULL, 3, NULL) != pdPASS) {
+#endif
         puts("__task creation failed!");
         while (1) {
         }

@@ -78,6 +78,26 @@ bool display_message_visible(void);
 /** Scroll the message view (positive detents = down). Thread-safe. */
 void display_message_scroll(int detents);
 
+/* NCP-1 revB: Numeric Comparison pairing modal variants. */
+typedef enum {
+    DISPLAY_PAIR_NUMCMP,   /* 6 digits + Accept/Reject (numeric comparison) */
+    DISPLAY_PAIR_PASSKEY,  /* 6 digits shown, host types (display-only)     */
+    DISPLAY_PAIR_CONSENT,  /* amber "Unverified computer" + Accept/Reject   */
+} display_pair_variant_t;
+
+/* Show the pairing modal. For CONSENT, num is ignored (no number shown).
+ * Thread-safe (bounded LVGL lock). */
+void display_pair_show(display_pair_variant_t variant, uint32_t gen, uint32_t num);
+void display_pair_hide(void);
+
+/* NCP-1: Wheel fallback for pairing modal. Returns true if the modal is
+ * visible (caller should route wheel events here instead of normal handling).
+ * wheel_nav: detents>0 moves selection right, <0 moves left.
+ * wheel_click: confirms the currently selected button. */
+bool display_pair_visible(void);
+void display_pair_wheel_nav(int detents);
+void display_pair_wheel_click(void);
+
 #ifdef __cplusplus
 }
 #endif

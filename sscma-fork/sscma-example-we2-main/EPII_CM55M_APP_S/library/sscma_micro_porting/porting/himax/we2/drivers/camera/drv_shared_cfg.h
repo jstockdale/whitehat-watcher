@@ -40,7 +40,7 @@
 #define SRAM_2_START_ADDR_FREE (JPEG_FILL_BASE_ADDR + JPEG_FILL_SIZE)
 #define SRAM_2_SIZE_FREE       (SRAM_2_SIZE - (SRAM_2_START_ADDR_FREE - SRAM_2_START_ADDR))
 
-/* v0.4.4 capture-only mode: full-frame raw capture at 1296x972.
+/* v0.4.5 capture-only mode: full-frame raw capture at 1296x972.
  * In CAPTURE_ONLY_MODE, the TFLM tensor arena (1,126,400 bytes) is not
  * allocated, freeing ~1.1MB in the FreeRTOS heap region
  * (0x34005000-0x3416A000). The raw frame buffer is allocated dynamically
@@ -53,6 +53,14 @@
 #define RAW8_FRAME_SIZE(w, h) ((size_t)(w) * (size_t)(h))
 /* Packed RAW10: 4 pixels in 5 bytes */
 #define RAW10_FRAME_SIZE(w, h) (((size_t)(w) * (size_t)(h) * 5 + 3) / 4)
+
+/* v0.4.15 (P4/P5): full-sensor-resolution mode (2592x1944, no sensor
+ * binning). The crop window is captured 1:1 into the raw buffer; its byte
+ * size is bounded by the proven heap budget (1296x972 RAW8 =
+ * 1,259,712 B — the size of the standard full-frame raw buffer). */
+#define RAW_FRAME_FULLRES_WIDTH_MAX  2592
+#define RAW_FRAME_FULLRES_HEIGHT_MAX 1944
+#define CROP_WINDOW_MAX_BYTES        1259712
 #endif
 
 #endif

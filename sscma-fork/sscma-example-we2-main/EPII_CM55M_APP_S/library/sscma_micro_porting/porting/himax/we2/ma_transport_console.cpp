@@ -34,7 +34,19 @@ static void _uart_dma_recv(void*) {
     if (!_is_opened || !_rb_rx || !_rx_buf || !_uart) {
         return;
     }
-    SCB_CleanDCache_by_Addr(_rx_buf, 1);
+    /* v0.4.13: INVALIDATE (not clean) the RX byte. This is a DMA-write
+     * buffer: the UART wrote the byte straight to SRAM, bypassing the
+     * DCache. SCB_CleanDCache_by_Addr only writes back dirty lines — it
+     * either clobbered the DMA'd byte with the stale cached copy (line
+     * dirty from the init memset) or left the stale cached byte in place
+     * (line clean). Either way the CPU pushed 0x00/stale bytes into the
+     * RX ring, so the AT server never saw a '\r' terminator and UART AT
+     * commands were silently swallowed on every v0.4.x build. Invalidate
+     * discards the cached line so the push below reads the DMA'd byte
+     * from SRAM. Safe: the CPU never writes meaningful data to _rx_buf
+     * (only the init memset), and the buffer is exactly one 32-byte
+     * cache line, so no adjacent data is discarded. */
+    SCB_InvalidateDCache_by_Addr(_rx_buf, 1);
     _rb_rx->push(_rx_buf, 1);
     _uart->uart_read_udma(_rx_buf, 1, reinterpret_cast<void*>(_uart_dma_recv));
 }
@@ -86,7 +98,14 @@ ma_err_t Console::init(const void* config) {
     }
 
     if (_rb_tx == nullptr) {
+#ifdef CAPTURE_ONLY_MODE
+        /* v0.4.6: 48 KiB -> 16 KiB in capture-only mode. The console TX ring
+         * only carries AT responses (a few KB max); the reclaimed 32 KiB
+         * helps the 1296x972 RAW8 frame allocation fit the heap. */
+        _rb_tx = new SPSCRingBuffer<char>(16 * 1024);
+#else
         _rb_tx = new SPSCRingBuffer<char>(48 * 1024);
+#endif
     }
 
     if (!_rx_buf || !_tx_buf || !_rb_rx || !_rb_tx) {
@@ -129,12 +148,14 @@ void Console::deInit() {
     }
 
     if (_rx_buf) {
-        delete[] _rx_buf;
+        /* v0.4.12: allocated with aligned new[] — pair with the aligned
+         * delete (see ma_device.cpp). */
+        ::operator delete[](_rx_buf, std::align_val_t{32});
         _rx_buf = nullptr;
     }
 
     if (_tx_buf) {
-        delete[] _tx_buf;
+        ::operator delete[](_tx_buf, std::align_val_t{32});
         _tx_buf = nullptr;
     }
 
@@ -194,6 +215,39 @@ size_t Console::receiveIf(char* data, size_t length, char delimiter) {
     }
 
     return _rb_rx->popIf(data, length, delimiter);
+}
+
+/* v0.4.20.7: Synchronized direct-UART print.
+ *
+ * ROOT CAUSE of the DIAG/JSON interleaving (not a mutex issue):
+ * - AT JSON responses go via Console::send() -> TX ring buffer -> UART DMA (async)
+ * - MA_LOGE/ma_printf go via vprintf -> console_putchar -> blocking direct UART register write
+ * Both hit the same USE_DW_UART_0 peripheral. When a JSON DMA is in flight and
+ * ma_printf does a direct register write, bytes interleave at the hardware level.
+ *
+ * This function coordinates the two paths: it holds _tx_mutex (blocking any new
+ * send() from starting DMA) and waits for _tx_busy to clear (in-flight DMA
+ * drained by the ISR), then performs the direct UART write. Safe because:
+ * - The DMA completion ISR (_uart_dma_send) never acquires _tx_mutex, so
+ *   holding the mutex in thread context does not block ISR progress.
+ * - _tx_busy is volatile and only cleared by the ISR when the ring is empty.
+ */
+extern "C" void ma_console_print_sync(const char* str) {
+    if (!_is_opened || !_uart || str == nullptr) {
+        return;
+    }
+    Guard guard(_tx_mutex);
+    /* Wait for in-flight DMA to drain. Yield to avoid starving the IDLE task
+     * that the DMA ISR depends on for FreeRTOS housekeeping. */
+    while (_tx_busy) {
+        ma::Thread::yield();
+    }
+    /* DMA idle and mutex held: no send() can start a new DMA, so the direct
+     * register writes below cannot collide with DMA writes. */
+    for (const char* p = str; *p != '\0'; ++p) {
+        unsigned char chr = (unsigned char)*p;
+        _uart->uart_write(&chr, 1);
+    }
 }
 
 }  // namespace ma

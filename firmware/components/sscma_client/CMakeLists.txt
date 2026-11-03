@@ -23,3 +23,8 @@ idf_component_register(SRCS ${srcs}
                        REQUIRES ${require}
                        PRIV_REQUIRES ${priv_requires}
                        )
+# v0.4.14 Phase 1: sscma_client_read_bulk() has no in-tree caller yet (the
+# frame-pull path will call it). The xtensa GCC 13.2 ignores
+# __attribute__((retain)) and __attribute__((used)) does not survive
+# --gc-sections, so force the linker to keep the symbol via -u.
+target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,-u,sscma_client_read_bulk")

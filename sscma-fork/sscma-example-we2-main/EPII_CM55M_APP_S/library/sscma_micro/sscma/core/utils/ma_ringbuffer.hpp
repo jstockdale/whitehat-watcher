@@ -73,6 +73,22 @@ template <typename T> class SPSCRingBuffer {
         return size;
     }
 
+    // v0.4.6.1: non-destructive read. Copies up to `size` bytes from the
+    // head of the queue without advancing the tail. ISR-safe (read-only).
+    size_t peek(T* data, size_t size) const noexcept {
+        if (!data || size == 0) {
+            return 0;
+        }
+        const size_t head = m_head.load();
+        const size_t tail = m_tail.load();
+        const size_t used = head >= tail ? head - tail : m_size - tail + head;
+        size              = size > used ? used : size;
+        for (size_t i = 0; i < size; ++i) {
+            data[i] = m_buffer[(tail + i) % m_size];
+        }
+        return size;
+    }
+
     size_t popIf(T* data, size_t size, T value) noexcept {
         if (!data || size == 0) {
             return 0;

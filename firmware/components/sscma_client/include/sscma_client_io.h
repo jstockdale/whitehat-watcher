@@ -152,6 +152,33 @@ esp_err_t sscma_client_io_available(sscma_client_io_handle_t io, size_t *len);
  */
 esp_err_t sscma_client_io_flush(sscma_client_io_handle_t io);
 
+/**
+ * @brief SPI channel self-test (v0.4.18.11)
+ *
+ * Sends CMD_TEST_PATTERN to the Himax, which generates a deterministic
+ * pattern, stages [pattern][CRC16], and the S3 verifies both data
+ * integrity and CRC. Isolates SPI transport issues from camera capture.
+ *
+ * @param[in] io IO handle (must be SPI)
+ * @param[in] len Test length in bytes (1-4094)
+ * @param[in] pattern_id Pattern: 0=zeros, 1=0xFF, 2=incrementing, 3=LCG
+ * @param[out] out Optional buffer to receive the pattern (len bytes), or NULL
+ * @return
+ *          - ESP_OK if CRC and data integrity both pass
+ *          - ESP_ERR_INVALID_ARG if parameters invalid
+ *          - ESP_ERR_INVALID_CRC if CRC mismatch
+ *          - ESP_ERR_INVALID_RESPONSE if data integrity fails
+ */
+esp_err_t sscma_client_io_spi_test_pattern(sscma_client_io_handle_t io,
+                                           uint16_t len, uint8_t pattern_id,
+                                           uint8_t *out);
+
+/* v0.4.18.50: Begin/end markers for spitest. Sets the test_active flag to
+ * prevent background AT polling from interfering during the entire test run
+ * (not just per-test-case). Call begin before the test loop, end after. */
+void sscma_client_io_spi_test_begin(sscma_client_io_handle_t io);
+void sscma_client_io_spi_test_end(sscma_client_io_handle_t io);
+
 #ifdef __cplusplus
 }
 #endif

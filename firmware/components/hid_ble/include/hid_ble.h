@@ -117,6 +117,36 @@ const char *hid_ble_device_name(void);
  *  non-printable characters. */
 esp_err_t hid_ble_set_device_name(const char *name);
 
+/* NCP-1 revB: Numeric Comparison pairing UI + Just Works consent gate.
+ *
+ * Pairing UI callback: invoked from the NimBLE host task — implementations
+ * must only queue and return (the .72 ble_evt rule). */
+typedef enum {
+    HID_BLE_PAIR_UI_PASSKEY,  /* PRIMARY: show 6 digits, host types them    */
+    HID_BLE_PAIR_UI_NUMCMP,   /* defensive only — cannot fire with
+                               * DISPLAY_ONLY per the SC table; kept so a
+                               * future io_cap change cannot reopen the
+                               * silent-default hole                        */
+    HID_BLE_PAIR_UI_CONSENT,  /* yes/no: unverified computer paired         */
+    HID_BLE_PAIR_UI_DISMISS,  /* dismiss any prompt                        */
+} hid_ble_pair_ui_t;
+
+typedef void (*hid_ble_pair_ui_cb_t)(uint32_t gen, hid_ble_pair_ui_t what,
+                                     uint32_t number /* NUMCMP/PASSKEY only */);
+void hid_ble_set_pair_ui_cb(hid_ble_pair_ui_cb_t cb);
+
+/* User's answer for BOTH prompt kinds (NC confirm and consent yes/no).
+ * Safe from any task. Stale gen / nothing pending → ESP_ERR_INVALID_STATE
+ * (late tap after timeout or disconnect: normal, ignore silently). */
+esp_err_t hid_ble_pair_confirm(uint32_t gen, bool accept);
+
+/* [revB] HID TX gate — report choke points check this before sending. */
+bool hid_ble_conn_approved(void);
+
+/* Abort an in-progress pairing: terminates the connection, which dismisses
+ * any modal via the DISCONNECT handler. Safe from any task. */
+void hid_ble_abort_pairing(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -9,6 +9,7 @@
  * clear of the screen corners (the panel is round). */
 
 #include "display.h"
+#include "hid_ble.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -271,11 +272,9 @@ static void touch_indev_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
     (void)drv;
     static lv_point_t last = { .x = 0, .y = 0 };
-    if (!kb_visible_) {
-        data->state = LV_INDEV_STATE_REL;
-        data->point = last;
-        return;
-    }
+    /* v0.4.18.76: Removed the kb_visible_ gate. Touch now flows to LVGL
+     * always; screens without touch handlers simply ignore it. The gate
+     * broke every touch UI outside KEYS mode (including pairing buttons). */
     uint16_t x[TOUCH_MAX_POINTS], y[TOUCH_MAX_POINTS], s[TOUCH_MAX_POINTS];
     int n = touch_ready() ? touch_read(x, y, s) : 0;
     if (n > 0) {
@@ -845,4 +844,219 @@ void display_message_scroll(int detents)
         lv_obj_scroll_by(msg_cont_, 0, -detents * 40, LV_ANIM_OFF);
         lvgl_port_unlock();
     }
+}
+
+
+/* NCP-1 revB: Pairing modal with touchscreen Yes/No.
+ * Three variants: NUMCMP (blue, 6 digits + buttons), PASSKEY (blue, 6 digits,
+ * no buttons — host types it), CONSENT (amber, no number, explicit warning).
+ * Buttons call hid_ble_pair_confirm directly (safe from LVGL task). */
+static lv_obj_t *pair_modal_ = NULL;
+static lv_obj_t *pair_title_ = NULL;
+static lv_obj_t *pair_num_label_ = NULL;
+static lv_obj_t *pair_sub_ = NULL;
+static lv_obj_t *pair_footer_ = NULL;
+static lv_obj_t *pair_btn_accept_ = NULL;
+static lv_obj_t *pair_btn_reject_ = NULL;
+static uint32_t pair_modal_gen_ = 0;
+static int pair_selected_ = 0;  /* 0=Accept, 1=Reject (wheel nav) */
+static display_pair_variant_t pair_variant_ = DISPLAY_PAIR_NUMCMP;
+
+/* Forward: defined after display_pair_show. */
+static void pair_update_selection(void);
+
+static void pair_btn_cb(lv_event_t *e)
+{
+    bool accept = (bool)(uintptr_t)lv_event_get_user_data(e);
+    /* Generation-guarded: stale taps after dismiss are dropped by
+     * hid_ble_pair_confirm (returns INVALID_STATE). */
+    esp_err_t rc = hid_ble_pair_confirm(pair_modal_gen_, accept);
+    if (rc == ESP_OK) {
+        ESP_LOGI("display", "pair %s (gen=%u)",
+                 accept ? "accepted" : "rejected", (unsigned)pair_modal_gen_);
+    }
+    /* Dismiss immediately on tap — the ENC_CHANGE/DISCONNECT handler will
+     * also dismiss, but the UI should feel instant. */
+    display_pair_hide();
+}
+
+void display_pair_show(display_pair_variant_t variant, uint32_t gen, uint32_t num)
+{
+    if (!ready_) {
+        return;
+    }
+    if (!lvgl_port_lock(pdMS_TO_TICKS(500))) {
+        ESP_LOGW("display", "pair_show: lvgl lock timeout");
+        return;
+    }
+
+    bool is_consent = (variant == DISPLAY_PAIR_CONSENT);
+    bool show_buttons = (variant != DISPLAY_PAIR_PASSKEY);
+    uint32_t accent = is_consent ? 0xffaa33 : 0x33ddff;  /* amber vs blue */
+
+    if (!pair_modal_) {
+        pair_modal_ = lv_obj_create(lv_scr_act());
+        lv_obj_set_size(pair_modal_, LV_PCT(100), LV_PCT(100));
+        lv_obj_set_style_bg_opa(pair_modal_, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(pair_modal_, 0, 0);
+        lv_obj_set_style_pad_all(pair_modal_, 20, 0);
+
+        pair_title_ = lv_label_create(pair_modal_);
+        lv_obj_set_style_text_font(pair_title_, &lv_font_montserrat_32, 0);
+        lv_obj_set_style_text_color(pair_title_, lv_color_hex(0xffffff), 0);
+        lv_obj_align(pair_title_, LV_ALIGN_TOP_MID, 0, 30);
+
+        pair_num_label_ = lv_label_create(pair_modal_);
+        lv_obj_set_style_text_font(pair_num_label_, &lv_font_montserrat_32, 0);
+        lv_obj_align(pair_num_label_, LV_ALIGN_CENTER, 0, -30);
+
+        pair_sub_ = lv_label_create(pair_modal_);
+        lv_obj_set_style_text_color(pair_sub_, lv_color_hex(0xaaaaaa), 0);
+        lv_obj_align(pair_sub_, LV_ALIGN_CENTER, 0, 30);
+
+        /* Footer hint (e.g. "Hold wheel to cancel" on PASSKEY). */
+        pair_footer_ = lv_label_create(pair_modal_);
+        lv_obj_set_style_text_color(pair_footer_, lv_color_hex(0x666666), 0);
+        lv_obj_align(pair_footer_, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+        /* Accept/Reject buttons side by side. */
+        pair_btn_accept_ = lv_btn_create(pair_modal_);
+        lv_obj_set_size(pair_btn_accept_, 140, 60);
+        lv_obj_align(pair_btn_accept_, LV_ALIGN_BOTTOM_LEFT, 20, -30);
+        lv_obj_set_style_bg_color(pair_btn_accept_, lv_color_hex(0x22aa44), 0);
+        lv_obj_t *al = lv_label_create(pair_btn_accept_);
+        lv_label_set_text(al, "Accept");
+        lv_obj_center(al);
+        lv_obj_add_event_cb(pair_btn_accept_, pair_btn_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)true);
+
+        pair_btn_reject_ = lv_btn_create(pair_modal_);
+        lv_obj_set_size(pair_btn_reject_, 140, 60);
+        lv_obj_align(pair_btn_reject_, LV_ALIGN_BOTTOM_RIGHT, -20, -30);
+        lv_obj_set_style_bg_color(pair_btn_reject_, lv_color_hex(0xaa2222), 0);
+        lv_obj_t *rl = lv_label_create(pair_btn_reject_);
+        lv_label_set_text(rl, "Reject");
+        lv_obj_center(rl);
+        lv_obj_add_event_cb(pair_btn_reject_, pair_btn_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)false);
+    }
+
+    /* Configure per variant. */
+    pair_modal_gen_ = gen;
+    pair_variant_ = variant;
+    pair_selected_ = 0;  /* default to Accept */
+    lv_obj_set_style_bg_color(pair_modal_, lv_color_hex(is_consent ? 0x2a1a0a : 0x111122), 0);
+    lv_obj_set_style_text_color(pair_num_label_, lv_color_hex(accent), 0);
+
+    if (is_consent) {
+        lv_label_set_text(pair_title_, "Unverified computer");
+        lv_label_set_text(pair_num_label_, "!");
+        lv_label_set_text(pair_sub_,
+            "This computer can't confirm\na pairing code. Allow it to\nconnect and receive keystrokes?");
+    } else if (variant == DISPLAY_PAIR_PASSKEY) {
+        lv_label_set_text(pair_title_, "Pairing code");
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%03u %03u",
+                 (unsigned)(num / 1000u), (unsigned)(num % 1000u));
+        lv_label_set_text(pair_num_label_, buf);
+        lv_label_set_text(pair_sub_, "Type this number\non the computer");
+        lv_label_set_text(pair_footer_, "Hold wheel to cancel");
+    } else {  /* NUMCMP */
+        lv_label_set_text(pair_title_, "Pair with computer?");
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%03u %03u",
+                 (unsigned)(num / 1000u), (unsigned)(num % 1000u));
+        lv_label_set_text(pair_num_label_, buf);
+        lv_label_set_text(pair_sub_,
+            "Confirm the same number\nis on the computer screen");
+    }
+
+    /* Buttons only where the user must decide. */
+    if (show_buttons) {
+        lv_obj_clear_flag(pair_btn_accept_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(pair_btn_reject_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(pair_btn_accept_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(pair_btn_reject_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    lv_obj_clear_flag(pair_modal_, LV_OBJ_FLAG_HIDDEN);
+    pair_update_selection();
+    lvgl_port_unlock();
+}
+
+void display_pair_hide(void)
+{
+    if (!ready_ || !pair_modal_) {
+        return;
+    }
+    if (!lvgl_port_lock(pdMS_TO_TICKS(500))) {
+        ESP_LOGW("display", "pair_hide: lvgl lock timeout");
+        return;
+    }
+    lv_obj_add_flag(pair_modal_, LV_OBJ_FLAG_HIDDEN);
+    pair_modal_gen_ = 0;
+    lvgl_port_unlock();
+}
+
+/* NCP-1: Wheel navigation fallback functions. */
+
+bool display_pair_visible(void)
+{
+    if (!ready_ || !pair_modal_) {
+        return false;
+    }
+    return !lv_obj_has_flag(pair_modal_, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void pair_update_selection(void)
+{
+    /* Highlight selected button with a white border. */
+    lv_obj_set_style_border_width(pair_btn_accept_,
+                                  pair_selected_ == 0 ? 3 : 0, 0);
+    lv_obj_set_style_border_color(pair_btn_accept_,
+                                  lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_border_width(pair_btn_reject_,
+                                  pair_selected_ == 1 ? 3 : 0, 0);
+    lv_obj_set_style_border_color(pair_btn_reject_,
+                                  lv_color_hex(0xffffff), 0);
+}
+
+void display_pair_wheel_nav(int detents)
+{
+    if (!display_pair_visible()) {
+        return;
+    }
+    /* NCP-1 revC: Wheel nav only where there's a decision to make.
+     * PASSKEY is display-only (no buttons). */
+    if (pair_variant_ == DISPLAY_PAIR_PASSKEY) {
+        return;
+    }
+    if (!lvgl_port_lock(pdMS_TO_TICKS(200))) {
+        return;
+    }
+    /* Any rotation toggles selection (only 2 buttons). */
+    if (detents != 0) {
+        pair_selected_ = 1 - pair_selected_;
+        pair_update_selection();
+    }
+    lvgl_port_unlock();
+}
+
+void display_pair_wheel_click(void)
+{
+    if (!display_pair_visible()) {
+        return;
+    }
+    /* NCP-1 revC: No-op for PASSKEY (display-only, nothing to confirm). */
+    if (pair_variant_ == DISPLAY_PAIR_PASSKEY) {
+        return;
+    }
+    bool accept = (pair_selected_ == 0);
+    esp_err_t rc = hid_ble_pair_confirm(pair_modal_gen_, accept);
+    if (rc == ESP_OK) {
+        ESP_LOGI("display", "pair wheel %s (gen=%u)",
+                 accept ? "accepted" : "rejected", (unsigned)pair_modal_gen_);
+    }
+    display_pair_hide();
 }

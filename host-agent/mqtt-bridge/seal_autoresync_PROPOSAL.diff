@@ -1,0 +1,82 @@
+--- a/seal_client.py
++++ b/seal_client.py
+@@ -23,6 +23,7 @@
+ import base64
+ import json
+ import os
++import re
+ import stat
+ import sys
+ import time
+@@ -38,6 +39,10 @@
+ 
+ COMMANDER_ID = "muse-01"
+ 
++# Throttle for the pre-send floor check (unix seconds, module-local).
++_last_floor_check = 0.0
++_FLOOR_CHECK_EVERY_S = 60.0
++
+ 
+ def load_signing_key():
+     with open(SEED_PATH) as f:
+@@ -91,10 +96,60 @@
+     return new
+ 
+ 
++
++def latest_reported_floor():
++    """Most recent seal_floor from the bridge telemetry log.
++
++    The device reports its (boot) floor in every heartbeat
++    (link.c:581 -> seal_dev_floor()). Returns None when the log is
++    missing/unreadable or carries no floor. This is a lower bound on
++    the live accept threshold, never an overestimate that could hurt.
++    """
++    log = os.path.join(os.path.dirname(os.path.abspath(__file__)),
++                       "telemetry.log")
++    try:
++        with open(log, "rb") as f:
++            f.seek(0, os.SEEK_END)
++            size = f.tell()
++            # Heartbeats land every few seconds; the last 64KB always
++            # covers several of them.
++            f.seek(max(0, size - 65536))
++            tail = f.read().decode("utf-8", "replace")
++    except OSError:
++        return None
++    ms = re.findall(r'"seal_floor":(\d+)', tail)
++    return int(ms[-1]) if ms else None
++
++
++def ensure_synced():
++    """Pre-send guard: resync when the device floor ran past our counter.
++
++    After a device reboot the floor ratchets to stored_high_water + 32
++    (D4), which can exceed our persisted counter. Sealing from the stale
++    counter would then eat loud REPLAY drops walking past it; resyncing
++    first skips that. Only ever raises the counter; the anti-oracle cap
++    in resync_counter() still applies. Throttled to once per minute.
++    """
++    global _last_floor_check
++    now = time.time()
++    if now - _last_floor_check < _FLOOR_CHECK_EVERY_S:
++        return
++    _last_floor_check = now
++    floor = latest_reported_floor()
++    if floor is None:
++        return
++    if floor > read_counter():
++        try:
++            resync_counter(floor)
++        except ValueError:
++            pass  # anti-oracle refusal: fall through to the normal path
++
++
+ def seal_command(cmd_id, cmd, topic="watcher/command"):
+     """Seal {"id": cmd_id, "cmd": cmd} -> {"sealed": base64_envelope}."""
+     body = json.dumps({"id": cmd_id, "cmd": cmd},
+                       separators=(",", ":")).encode()
++    ensure_synced()
+     ctr = next_counter()
+     ts_ms = int(time.time() * 1000)
+     env = mqs.seal_control(topic, COMMANDER_ID, ctr, ts_ms, body,

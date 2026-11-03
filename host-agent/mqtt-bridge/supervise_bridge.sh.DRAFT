@@ -1,0 +1,59 @@
+#!/bin/bash
+# Bridge supervisor (DRAFT — not installed; awaiting John's go).
+#
+# The MQTT bridge subscriber has died silently twice on 2026-10-04 with no
+# traceback; each manual restart truncates subscriber.log, destroying the
+# last lines before the death. This check is meant to run from cron every
+# 5 minutes: if the bridge is healthy it does nothing; if the subscriber
+# is gone AND telemetry is stale, it snapshots forensics, then restarts
+# the bridge from the documented credential file and APPENDS (never
+# truncates) the log so the death's last lines survive.
+#
+# John's standing rule: the subscriber stays up at all times rather than
+# being started on demand. No systemd user bus exists in this environment,
+# so this cron check is the supervisor. The MQTT password is never stored
+# here — it comes only from ~/.config/watcher-mqtt.env (0600) at runtime.
+
+set -u
+BRIDGE_DIR="$HOME/workspace/projects/watcher-input-assistant/host-agent/mqtt-bridge"
+LOG="$BRIDGE_DIR/subscriber.log"
+TEL="$BRIDGE_DIR/telemetry.log"
+FORENSIC="$BRIDGE_DIR/bridge_supervisor.log"
+ENV_FILE="$HOME/.config/watcher-mqtt.env"
+STALE_SECS=180
+
+now=$(date +%s)
+tel_age="never"
+if [ -f "$TEL" ]; then
+    tel_age=$(( now - $(stat -c %Y "$TEL") ))
+fi
+
+if pgrep -f "^python3 subscriber.py" >/dev/null 2>&1; then
+    # Process alive: only healthy if telemetry is actually flowing.
+    if [ "$tel_age" != "never" ] && [ "$tel_age" -lt "$STALE_SECS" ]; then
+        exit 0
+    fi
+    reason="subscriber alive but telemetry stale (${tel_age}s)"
+else
+    reason="no subscriber.py process (telemetry age ${tel_age}s)"
+fi
+
+# --- Forensic snapshot BEFORE restart (root-cause evidence) ---
+{
+    echo "=== $(date '+%F %T') supervisor: bridge down — $reason ==="
+    echo "--- pgrep ---"; pgrep -af "subscriber.py" || echo "(none)"
+    echo "--- last 30 lines of subscriber.log ---"; tail -30 "$LOG" 2>/dev/null
+    echo "--- dmesg oom/segv tail ---"; dmesg 2>/dev/null | tail -5 || echo "(dmesg unavailable)"
+    echo "--- disk ---"; df -h "$BRIDGE_DIR" | tail -1
+} >> "$FORENSIC" 2>&1
+
+# --- Restart (append, never truncate) ---
+if [ ! -f "$ENV_FILE" ]; then
+    echo "$(date '+%F %T') supervisor: $ENV_FILE missing, cannot restart" >> "$FORENSIC"
+    exit 1
+fi
+cd "$BRIDGE_DIR" || exit 1
+set -a; . "$ENV_FILE"; set +a
+echo "$(date '+%F %T') supervisor: restarting subscriber.py ($reason)" >> "$LOG"
+nohup python3 subscriber.py >> "$LOG" 2>&1 &
+echo "$(date '+%F %T') supervisor: restarted pid $!" >> "$FORENSIC"

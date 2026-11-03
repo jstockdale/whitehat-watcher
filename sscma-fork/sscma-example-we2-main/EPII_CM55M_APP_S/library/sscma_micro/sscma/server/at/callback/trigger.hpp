@@ -97,6 +97,7 @@ void initDefaultTrigger(Encoder& encoder) {
 
     std::vector<std::string> args{"INIT@TRIGGER", std::move(trigger)};
     configureTrigger(args, *transport, encoder, true);
+    broadcastInitEvent(encoder);
 }
 
 }  // namespace ma::server::callback

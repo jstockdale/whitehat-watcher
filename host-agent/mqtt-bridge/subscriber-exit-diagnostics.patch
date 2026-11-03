@@ -1,0 +1,60 @@
+--- a/subscriber.py
++++ b/subscriber.py
+@@ -16,9 +16,11 @@
+     watcher/command    Muse -> console : {"id","cmd"}  (downlink, later)
+ """
+ 
++import atexit
+ import base64
+ import json
+ import os
++import signal
+ import ssl
+ import sys
+ import threading
+@@ -311,6 +313,29 @@
+     if not PASS:
+         print("MQTT_PASS is not set", file=sys.stderr)
+         sys.exit(2)
++    # Exit diagnostics (prepared 2026-10-16): 109 of 150 rc=128
++    # disconnects since Oct 5 are the dying process's last log line,
++    # with zero tracebacks, zero "loop_forever returned" lines and
++    # zero "connect failed" lines in subscriber.log. Log every
++    # remaining way out so the next death names its cause: a signal
++    # (external kill), SystemExit, or atexit with neither (clean
++    # interpreter teardown).
++    def _log_exit(reason: str) -> None:
++        try:
++            log_line(f"[exit-diag] process exiting: {reason}")
++        except Exception:
++            pass
++
++    def _on_signal(signum, frame):
++        _log_exit(f"signal {signal.Signals(signum).name} ({signum})")
++        # Restore the default disposition and re-deliver, so exit
++        # semantics and the status the watchdog sees do not change.
++        signal.signal(signum, signal.SIG_DFL)
++        os.kill(os.getpid(), signum)
++
++    for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
++        signal.signal(_sig, _on_signal)
++    atexit.register(_log_exit, "atexit (no signal, no exception logged)")
+     _tel_keys_init()  # D5b: load telemetry seed (fp logged, seed never)
+     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                          client_id="muse-bridge-1")
+@@ -334,8 +359,13 @@
+         # thread is exiting and the process will die with no traceback —
+         # log it so a silent death becomes a diagnosed one.
+         log_line(f"loop_forever returned rc={rc}; bridge exiting")
+-    except KeyboardInterrupt:
+-        log_line("stopped")
++    except BaseException as e:
++        # BaseException, not Exception: also catches SystemExit (e.g.
++        # a sys.exit() inside a paho callback) and KeyboardInterrupt,
++        # both of which currently leave no line in the log at all.
++        log_line(f"loop_forever raised {type(e).__name__}: {e!r}; "
++                 f"bridge exiting")
++        raise
+ 
+ 
+ if __name__ == "__main__":

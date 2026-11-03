@@ -155,4 +155,26 @@ APP_TYPE = sscma
  
 ### Options above must be added before include options.mk ###
 override EPII_ROOT := $(strip $(subst \,/,$(EPII_ROOT)))
+# v0.4.20.57 (John 2026-10-08): Generate build hash deterministically on every
+# make invocation. The fingerprint must be unique per build; a stale hash
+# means a stale build. This runs at makefile parse time, before compilation.
+$(shell $(EPII_ROOT)/gen_build_hash.sh > /dev/null 2>&1)
 include $(EPII_ROOT)/options/options.mk
+
+# v0.4.20.57 (John 2026-10-08): Deterministic clean build target.
+# The Himax build has broken header dependency tracking — header changes
+# don't trigger object rebuilds. This target guarantees a pristine build
+# every time: regenerates the build hash, wipes all objects, rebuilds.
+# USE THIS INSTEAD OF PLAIN 'make' FOR ALL HIMAX BUILDS.
+.PHONY: cleanbuild
+cleanbuild:
+	@echo "=== Himax deterministic clean build ==="
+	@echo "Step 1/3: Regenerating build hash..."
+	@$(EPII_ROOT)/gen_build_hash.sh
+	@echo "Step 2/3: Full clean (rm -rf obj_*)..."
+	@rm -rf $(EPII_ROOT)/obj_epii_evb_icv30_bdv10
+	@echo "Step 3/3: Building..."
+	@$(MAKE) --no-print-directory
+	@echo "=== Build complete ==="
+	@echo "Verify fingerprint:"
+	@strings $(EPII_ROOT)/obj_epii_evb_icv30_bdv10/gnu_epii_evb_WLCSP65/EPII_CM55M_gnu_epii_evb_WLCSP65_s.elf 2>/dev/null | grep -o "[a-f0-9]\{16\}" | head -1

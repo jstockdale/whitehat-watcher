@@ -85,6 +85,19 @@ esp_err_t sscma_client_init(sscma_client_handle_t client);
  */
 esp_err_t sscma_client_reset(sscma_client_handle_t client);
 /**
+ * @brief Discard any stale partial frame in the client's RX buffer
+ *
+ * Suspends the process task, resets the RX parser buffer, and resumes.
+ * Used after a peer reboot is detected so the fresh byte stream parses
+ * cleanly. Safe to call from any task except the client's own process
+ * task.
+ *
+ * @param[in] client SCCMA client handle
+ * @return
+ *          - ESP_OK on success
+ */
+esp_err_t sscma_client_flush_rx(sscma_client_handle_t client);
+/**
  * @brief Read data from SCCMA client
  *
  * @param[in] client SCCMA client handle
@@ -96,6 +109,24 @@ esp_err_t sscma_client_reset(sscma_client_handle_t client);
  *          - ESP_OK                on success
  */
 esp_err_t sscma_client_read(sscma_client_handle_t client, void *data, size_t size);
+
+/**
+ * @brief Bulk read for known-length transfers (Phase 1 SPI optimization)
+ *
+ * Loops read() in 4095-byte chunks WITHOUT per-chunk available() polling.
+ * Use when the caller already knows the transfer length (e.g. frame pulls).
+ * The wire protocol is unchanged; each chunk is retried once after a short
+ * backoff on transient failure.
+ *
+ * @param[in] client SCCMA client handle
+ * @param[out] data Destination buffer (must hold size bytes)
+ * @param[in] size Total bytes to read
+ * @return
+ *          - ESP_ERR_INVALID_ARG   if parameter is invalid
+ *          - ESP_ERR_NOT_SUPPORTED if read is not supported by transport
+ *          - ESP_OK                on success
+ */
+esp_err_t sscma_client_read_bulk(sscma_client_handle_t client, void *data, size_t size);
 
 /**
  * @brief Write data to SCCMA client

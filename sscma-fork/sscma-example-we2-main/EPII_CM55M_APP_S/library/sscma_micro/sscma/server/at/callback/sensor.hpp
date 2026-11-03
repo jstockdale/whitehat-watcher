@@ -101,6 +101,7 @@ void initDefaultSensor(Encoder& encoder) {
     std::vector<std::string> args{
       "INIT@SENSOR", std::to_string(static_cast<int>(sensor_id)), "1", std::to_string(static_cast<int>(opt_id))};
     configureSensor(args, *transport, encoder, true);
+    broadcastInitEvent(encoder);
 }
 
 void getSensorStatus(const std::vector<std::string>& args, Transport& transport, Encoder& encoder) {

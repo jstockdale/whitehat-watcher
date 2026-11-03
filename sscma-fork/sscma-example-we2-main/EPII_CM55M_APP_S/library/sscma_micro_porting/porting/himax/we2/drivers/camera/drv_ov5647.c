@@ -78,6 +78,27 @@ static HX_CIS_SensorSetting_t OV5647_init_setting[] = {
 #define CIS_I2C_ID                OV5647_SENSOR_I2CID
 #define SENSORDPLIB_SENSOR_OV5647 (SENSORDPLIB_SENSOR_HM2130)
 
+#ifdef CAPTURE_ONLY_MODE
+/* v0.4.15 (P4/P5): full-sensor-resolution (2592x1944) register table,
+ * available at runtime for the zoom-crop / strip-capture paths. The
+ * firmware still compiles in 1296x972 MIPI mode; this table is written
+ * by drv_ov5647_init_raw_fullres() when entering full-res capture mode.
+ * The .i file is a plain initializer list, identical in form to the
+ * compile-time OV5647_init_setting above. */
+static HX_CIS_SensorSetting_t OV5647_init_setting_2592x1944[] = {
+    #include "OV5647_mipi_2lane_2592x1944.i"
+};
+#endif /* CAPTURE_ONLY_MODE */
+
+/* v0.4.15 (P4/P5): tracks whether the sensor was last programmed for the
+ * 2592x1944 full-res mode. With ENABLE_SENSOR_FAST_SWITCH, the standard
+ * init paths skip sensor register programming when _initiated_before is
+ * set — they must NOT skip when the sensor is still in full-res mode, or
+ * the INP would be configured for 1296x972 against a 2592x1944 stream.
+ * Defined unconditionally so the standard init paths can check it without
+ * #ifdef clutter; only meaningful in CAPTURE_ONLY_MODE. */
+static bool _sensor_fullres_mode = false;
+
 static HX_CIS_SensorSetting_t OV5647_stream_on[] = {
   {HX_CIS_I2C_Action_W, 0x4800, OV5647_MIPI_CTRL_ON},
   {HX_CIS_I2C_Action_W, 0x4202,                0x00},
@@ -225,12 +246,14 @@ static uint32_t ov5647_set_dp_rc96() {
     return mipi_pixel_clk;
 }
 
-static void set_mipi_csirx_enable() {
+/* v0.4.15 (P4): line/frame length are parameters so the full-res
+ * (2592x1944) sensor mode can configure the CSI RX without a rebuild.
+ * Existing call sites pass the compile-time sensor dims (zero behavior
+ * change); the full-res init path passes 2592x1944. */
+static void set_mipi_csirx_enable(uint16_t line_length, uint16_t frame_length) {
     uint32_t bitrate_1lane  = OV5647_MIPI_CLOCK_FEQ * 2;
     uint32_t mipi_lnno      = OV5647_MIPI_LANE_CNT;
     uint32_t pixel_dpp      = OV5647_MIPI_DPP;
-    uint32_t line_length    = OV5647_SENSOR_WIDTH;
-    uint32_t frame_length   = OV5647_SENSOR_HEIGHT;
     uint32_t byte_clk       = bitrate_1lane / 8;
     uint32_t continuousout  = OV5647_MIPITX_CNTCLK_EN;
     uint32_t deskew_en      = 0;
@@ -349,6 +372,16 @@ ma_err_t drv_ov5647_init(uint16_t width, uint16_t height, int compression) {
         return MA_EINVAL;
     }
 
+    /* v0.4.15 (P4/P5): the sensor may be sitting in 2592x1944 full-res mode
+     * from a zoom-crop / strip capture. Fast-switch would skip the register
+     * rewrite and leave the INP (1296x972 config) mismatched against a
+     * 2592x1944 stream — force the full init path. */
+    if (_sensor_fullres_mode) {
+        MA_LOGD(MA_TAG, "Leaving full-res mode: forcing full sensor re-init");
+        _initiated_before  = false;
+        _sensor_fullres_mode = false;
+    }
+
     _drv_dp_event_cb_on_frame_ready = NULL;
     _drv_dp_on_next_stream          = NULL;
 
@@ -406,7 +439,7 @@ ma_err_t drv_ov5647_init(uint16_t width, uint16_t height, int compression) {
             MA_LOGE(MA_TAG, "Camera Set Mirror Setting Fail: %d", ec);
         }
 
-        set_mipi_csirx_enable();
+        set_mipi_csirx_enable(OV5647_SENSOR_WIDTH, OV5647_SENSOR_HEIGHT);
 #if ENABLE_SENSOR_FAST_SWITCH
     }
 #endif
@@ -621,6 +654,12 @@ void drv_ov5647_deinit() {
 
     sensordplib_stop_capture();
 
+    /* Reset the fast-switch flag so the next init() does a full sensor
+     * register programming. Without this, re-init after deInit skips
+     * the sensor setup (ENABLE_SENSOR_FAST_SWITCH) and the sensor is
+     * left in a bad state -> "RawDump: camera not initialized". */
+    _initiated_before = false;
+
 #if !ENABLE_SENSOR_FAST_SWITCH
     _frame_count = 0;
 
@@ -641,7 +680,7 @@ void drv_ov5647_deinit() {
 }
 
 #ifdef CAPTURE_ONLY_MODE
-/* v0.4.4 experimental: full-frame raw capture support.
+/* v0.4.5: full-frame raw capture support.
  * The raw frame buffer is allocated by the caller (CameraHimax) from the
  * heap (TFLM arena freed in capture-only mode) and registered here.
  * drv_ov5647_raw_dump() uses this buffer instead of the 600KB YUV buffer
@@ -672,6 +711,14 @@ ma_err_t drv_ov5647_init_raw(uint16_t width, uint16_t height, uint8_t bits) {
     if (!width || !height || width > RAW_FRAME_WIDTH_MAX || height > RAW_FRAME_HEIGHT_MAX) {
         MA_LOGE(MA_TAG, "Invalid raw resolution %dx%d", width, height);
         return MA_EINVAL;
+    }
+
+    /* v0.4.15 (P4/P5): same full-res-mode exit as drv_ov5647_init — the
+     * sensor must be reprogrammed back to the 1296x972 table. */
+    if (_sensor_fullres_mode) {
+        MA_LOGD(MA_TAG, "Leaving full-res mode: forcing full sensor re-init");
+        _initiated_before  = false;
+        _sensor_fullres_mode = false;
     }
     if (bits != 8 && bits != 10) {
         MA_LOGE(MA_TAG, "Invalid raw bits %u (must be 8 or 10)", bits);
@@ -719,7 +766,7 @@ ma_err_t drv_ov5647_init_raw(uint16_t width, uint16_t height, uint8_t bits) {
             MA_LOGE(MA_TAG, "Raw: Camera Set Mirror Setting Fail");
         }
 
-        set_mipi_csirx_enable();
+        set_mipi_csirx_enable(OV5647_SENSOR_WIDTH, OV5647_SENSOR_HEIGHT);
 #if ENABLE_SENSOR_FAST_SWITCH
     }
 #endif
@@ -768,9 +815,218 @@ ma_err_t drv_ov5647_init_raw(uint16_t width, uint16_t height, uint8_t bits) {
     }
 #endif
 
+    /* v0.4.20.2: the raw path never turned the sensor stream on (the JPEG
+     * init does, but init_raw doesn't). After deInit()'s xSleep, or on
+     * first boot, the sensor isn't streaming and rawDump() times out
+     * waiting for a frame. Turn the stream on unconditionally — harmless
+     * if already streaming. */
+    ec = hx_drv_cis_setRegTable(OV5647_stream_on, HX_CIS_SIZE_N(OV5647_stream_on, HX_CIS_SensorSetting_t));
+    if (ec != HX_CIS_NO_ERROR) {
+        MA_LOGE(MA_TAG, "Raw: Camera Set Stream On Fail: %d", ec);
+        return MA_EIO;
+    }
+
+    /* v0.4.20.1: mark the camera initialized on raw-path success, mirroring
+     * drv_ov5647_init(). Without this, drv_ov5647_raw_dump() refuses with
+     * "RawDump: camera not initialized" even after a successful init. */
+    _initiated_before = true;
+
     return ret;
 }
 #endif /* CAPTURE_ONLY_MODE */
+
+/* v0.4.15 (P4/P5): full-sensor-resolution raw init.
+ * Programs the OV5647 for 2592x1944 MIPI output (no sensor binning) and
+ * configures the INP for 1:1 capture of the crop window (x, y, w, h).
+ * Coordinates must be even (Bayer phase) and the window must fit in
+ * CROP_WINDOW_MAX_BYTES (the proven heap budget for the raw buffer).
+ * The caller (CameraHimax) allocates the w*h-byte raw buffer before this.
+ * On success the sensor is left in 2592x1944 mode; the standard init paths
+ * detect _sensor_fullres_mode and force a full re-init on the way back. */
+ma_err_t drv_ov5647_init_raw_fullres(uint16_t crop_x, uint16_t crop_y, uint16_t crop_w, uint16_t crop_h,
+                                     uint8_t bits) {
+    if (!crop_w || !crop_h) {
+        MA_LOGE(MA_TAG, "Fullres: empty crop window");
+        return MA_EINVAL;
+    }
+    if ((crop_x | crop_y | crop_w | crop_h) & 1) {
+        MA_LOGE(MA_TAG, "Fullres: crop geometry must be even (Bayer phase)");
+        return MA_EINVAL;
+    }
+    if (crop_x + crop_w > RAW_FRAME_FULLRES_WIDTH_MAX || crop_y + crop_h > RAW_FRAME_FULLRES_HEIGHT_MAX) {
+        MA_LOGE(MA_TAG, "Fullres: crop %u,%u %ux%u outside 2592x1944", crop_x, crop_y, crop_w, crop_h);
+        return MA_EINVAL;
+    }
+    if ((size_t)crop_w * (size_t)crop_h > CROP_WINDOW_MAX_BYTES) {
+        MA_LOGE(MA_TAG, "Fullres: crop %ux%u exceeds %u-byte window budget", crop_w, crop_h,
+                (unsigned)CROP_WINDOW_MAX_BYTES);
+        return MA_EINVAL;
+    }
+    if (bits != 8 && bits != 10) {
+        MA_LOGE(MA_TAG, "Fullres: invalid raw bits %u (must be 8 or 10)", bits);
+        return MA_EINVAL;
+    }
+
+    ma_err_t ret = MA_OK;
+    int      ec;
+
+    /* Always (re)program the sensor: we may be switching from 1296 mode or
+     * re-entering with a different window. */
+    _initiated_before = false;
+
+    MA_LOGD(MA_TAG, "Fullres: camera init pin");
+    ec = hx_drv_cis_init((CIS_XHSHUTDOWN_INDEX_E)DEAULT_XHSUTDOWN_PIN, SENSORCTRL_MCLK_DIV3);
+    if (ec != HX_CIS_NO_ERROR) {
+        MA_LOGE(MA_TAG, "Fullres: Camera CIS Init Fail: %d", ec);
+        return MA_EIO;
+    }
+
+    MA_CAMERA_PWR_CTRL_INIT_F;
+    hx_drv_timer_cm55x_delay_ms(10, TIMER_STATE_DC);
+
+    ec = hx_drv_cis_set_slaveID(CIS_I2C_ID);
+    if (ec != HX_CIS_NO_ERROR) {
+        MA_LOGE(MA_TAG, "Fullres: Camera Set Slave ID Fail: %d", ec);
+        return MA_EIO;
+    }
+
+    hx_drv_timer_cm55x_delay_ms(3, TIMER_STATE_DC);
+
+    ec = hx_drv_cis_setRegTable(OV5647_stream_off, HX_CIS_SIZE_N(OV5647_stream_off, HX_CIS_SensorSetting_t));
+    if (ec != HX_CIS_NO_ERROR) {
+        MA_LOGE(MA_TAG, "Fullres: Camera Set Stream Off Fail: %d", ec);
+        return MA_EIO;
+    }
+
+    ec = hx_drv_cis_setRegTable(OV5647_init_setting_2592x1944,
+                                HX_CIS_SIZE_N(OV5647_init_setting_2592x1944, HX_CIS_SensorSetting_t));
+    if (ec != HX_CIS_NO_ERROR) {
+        MA_LOGE(MA_TAG, "Fullres: Camera Set 2592x1944 Init Setting Fail: %d", ec);
+        return MA_EIO;
+    }
+
+    ec = hx_drv_cis_setRegTable(OV5647_mirror_setting, HX_CIS_SIZE_N(OV5647_mirror_setting, HX_CIS_SensorSetting_t));
+    if (ec != HX_CIS_NO_ERROR) {
+        MA_LOGE(MA_TAG, "Fullres: Camera Set Mirror Setting Fail");
+    }
+
+    set_mipi_csirx_enable(RAW_FRAME_FULLRES_WIDTH_MAX, RAW_FRAME_FULLRES_HEIGHT_MAX);
+
+    /* 1:1 capture of the crop window: no INP subsampling, no binning. */
+    INP_CROP_T crop;
+    crop.start_x = crop_x;
+    crop.start_y = crop_y;
+    crop.last_x  = (uint16_t)(crop_x + crop_w - 1);
+    crop.last_y  = (uint16_t)(crop_y + crop_h - 1);
+
+    ec = sensordplib_set_sensorctrl_inp_wi_crop_bin(SENSORDPLIB_SENSOR_OV5647,
+                                                    SENSORDPLIB_STREAM_NONEAOS,
+                                                    RAW_FRAME_FULLRES_WIDTH_MAX,
+                                                    RAW_FRAME_FULLRES_HEIGHT_MAX,
+                                                    INP_SUBSAMPLE_DISABLE,
+                                                    crop,
+                                                    INP_BINNING_DISABLE);
+    if (ec != 0) {
+        MA_LOGE(MA_TAG, "Fullres: Camera Set Sensor Control Fail: %d", ec);
+        return MA_EIO;
+    }
+
+    /* WDMA base addresses + datapath callbacks (idempotent re-register). */
+    sensordplib_set_xDMA_baseaddrbyapp(_wdma1_baseaddr, _wdma2_baseaddr, _wdma3_baseaddr);
+    sensordplib_set_jpegfilesize_addrbyapp(_jpegsize_baseaddr);
+    hx_dplib_register_cb(_drv_dp_event_cb, SENSORDPLIB_CB_FUNTYPE_DP);
+
+    _frame.width  = crop_w;
+    _frame.height = crop_h;
+    _frame.size   = (bits == 8) ? RAW8_FRAME_SIZE(crop_w, crop_h) : RAW10_FRAME_SIZE(crop_w, crop_h);
+    /* _frame.data is set at capture time from the registered raw buffer. */
+
+    MA_LOGD(MA_TAG, "Fullres raw init: crop %u,%u %ux%u %u-bit, frame size %lu", crop_x, crop_y, crop_w, crop_h,
+            bits, (unsigned long)_frame.size);
+
+    ec = hx_drv_cis_setRegTable(OV5647_stream_on, HX_CIS_SIZE_N(OV5647_stream_on, HX_CIS_SensorSetting_t));
+    if (ec != HX_CIS_NO_ERROR) {
+        MA_LOGE(MA_TAG, "Fullres: Camera Set Stream On Fail: %d", ec);
+        ret = MA_EIO;
+        goto err;
+    }
+
+    sensordplib_set_mclkctrl_xsleepctrl_bySCMode();
+    ec = sensordplib_set_sensorctrl_start();
+    if (ec != 0) {
+        MA_LOGE(MA_TAG, "Fullres: Camera Set Sensor Control Start Fail: %d", ec);
+        ret = MA_EIO;
+        goto err;
+    }
+
+    _initiated_before   = true;
+    _sensor_fullres_mode = true;
+    return ret;
+
+err:
+    MA_LOGD(MA_TAG, "Fullres Camera Init Failed!");
+    _initiated_before   = false;
+    _sensor_fullres_mode = false;
+    sensordplib_stop_capture();
+    sensordplib_start_swreset();
+    return ret;
+}
+
+/* v0.4.15 (P5): move the full-res crop window without touching the sensor.
+ * The sensor keeps streaming 2592x1944; only the INP crop is reprogrammed.
+ * The datapath is stopped first (same ordering as drv_ov5647_init_raw);
+ * the next drv_ov5647_raw_dump() restarts it. Geometry is validated
+ * exactly like drv_ov5647_init_raw_fullres(). */
+ma_err_t drv_ov5647_recrop_fullres(uint16_t crop_x, uint16_t crop_y, uint16_t crop_w, uint16_t crop_h) {
+    if (!_sensor_fullres_mode) {
+        MA_LOGE(MA_TAG, "Recrop: sensor not in full-res mode");
+        return MA_EPERM;
+    }
+    if (!crop_w || !crop_h) {
+        MA_LOGE(MA_TAG, "Recrop: empty crop window");
+        return MA_EINVAL;
+    }
+    if ((crop_x | crop_y | crop_w | crop_h) & 1) {
+        MA_LOGE(MA_TAG, "Recrop: crop geometry must be even (Bayer phase)");
+        return MA_EINVAL;
+    }
+    if (crop_x + crop_w > RAW_FRAME_FULLRES_WIDTH_MAX || crop_y + crop_h > RAW_FRAME_FULLRES_HEIGHT_MAX) {
+        MA_LOGE(MA_TAG, "Recrop: crop %u,%u %ux%u outside 2592x1944", crop_x, crop_y, crop_w, crop_h);
+        return MA_EINVAL;
+    }
+    if ((size_t)crop_w * (size_t)crop_h > CROP_WINDOW_MAX_BYTES) {
+        MA_LOGE(MA_TAG, "Recrop: crop %ux%u exceeds %u-byte window budget", crop_w, crop_h,
+                (unsigned)CROP_WINDOW_MAX_BYTES);
+        return MA_EINVAL;
+    }
+
+    sensordplib_stop_capture();
+
+    INP_CROP_T crop;
+    crop.start_x = crop_x;
+    crop.start_y = crop_y;
+    crop.last_x  = (uint16_t)(crop_x + crop_w - 1);
+    crop.last_y  = (uint16_t)(crop_y + crop_h - 1);
+
+    int ec = sensordplib_set_sensorctrl_inp_wi_crop_bin(SENSORDPLIB_SENSOR_OV5647,
+                                                        SENSORDPLIB_STREAM_NONEAOS,
+                                                        RAW_FRAME_FULLRES_WIDTH_MAX,
+                                                        RAW_FRAME_FULLRES_HEIGHT_MAX,
+                                                        INP_SUBSAMPLE_DISABLE,
+                                                        crop,
+                                                        INP_BINNING_DISABLE);
+    if (ec != 0) {
+        MA_LOGE(MA_TAG, "Recrop: Camera Set Sensor Control Fail: %d", ec);
+        return MA_EIO;
+    }
+
+    _frame.width  = crop_w;
+    _frame.height = crop_h;
+    _frame.size   = RAW8_FRAME_SIZE(crop_w, crop_h);
+
+    MA_LOGD(MA_TAG, "Fullres recrop: %u,%u %ux%u", crop_x, crop_y, crop_w, crop_h);
+    return MA_OK;
+}
 
 /* Phase 3 (AT+RAWDUMP): WDMA2 raw format probe.
  * See phase3-rawdump-design.md for the full design. */
@@ -802,27 +1058,35 @@ ma_err_t drv_ov5647_raw_dump(drv_raw_dump_result_t* out) {
     }
 
 #ifdef CAPTURE_ONLY_MODE
-    /* v0.4.4: use the registered full-frame raw buffer if available,
+    /* v0.4.5: use the registered full-frame raw buffer if available,
      * otherwise fall back to the YUV422 frame buffer. */
     uint8_t* buf;
     uint32_t buf_sz;
+    uint32_t need_max;
     if (_raw_frame_buf != NULL && _raw_frame_buf_size > 0) {
         buf    = _raw_frame_buf;
         buf_sz = (uint32_t)_raw_frame_buf_size;
+        /* v0.4.5: expect the exact packing size for the configured bit depth.
+         * The old unconditional w*h*2 worst case wrongly rejected the RAW8
+         * buffer (1.26MB < 2.52MB) with MA_ENOMEM. */
+        need_max = (_raw_frame_bits == 10)
+                       ? (uint32_t)(((uint32_t)w * (uint32_t)h * 5u + 3u) / 4u)
+                       : (uint32_t)w * (uint32_t)h;
         MA_LOGD(MA_TAG, "RawDump: using registered raw buffer %p %lu bytes", buf, (unsigned long)buf_sz);
     } else {
         /* Capture into the YUV422 frame buffer: 600KB, unused while the raw
          * path is active. Worst case (16-bit) needs w*h*2 bytes. */
-        buf    = (uint8_t*)_wdma3_baseaddr;
-        buf_sz = YUV422_BASE_SIZE;
+        buf      = (uint8_t*)_wdma3_baseaddr;
+        buf_sz   = YUV422_BASE_SIZE;
+        need_max = (uint32_t)w * (uint32_t)h * 2u;
     }
 #else
     /* Capture into the YUV422 frame buffer: 600KB, unused while the raw
      * path is active. Worst case (16-bit) needs w*h*2 bytes. */
-    uint8_t* buf    = (uint8_t*)_wdma3_baseaddr;
-    uint32_t buf_sz = YUV422_BASE_SIZE;
-#endif
+    uint8_t* buf      = (uint8_t*)_wdma3_baseaddr;
+    uint32_t buf_sz   = YUV422_BASE_SIZE;
     uint32_t need_max = (uint32_t)w * (uint32_t)h * 2u;
+#endif
     if (need_max > buf_sz) {
         MA_LOGE(MA_TAG, "RawDump: %ux%u needs %lu > %lu buffer", w, h,
                 (unsigned long)need_max, (unsigned long)buf_sz);
@@ -830,6 +1094,10 @@ ma_err_t drv_ov5647_raw_dump(drv_raw_dump_result_t* out) {
     }
 
     memset(buf, 0xAA, buf_sz);
+    /* v0.4.5: push the 0xAA fill out to memory so the post-capture
+     * invalidate (below) doesn't resurrect stale bytes in the unwritten
+     * tail — the byte-count scan must see 0xAA past the DMA'd frame. */
+    hx_CleanDCache_by_Addr((volatile void*)buf, (int32_t)(buf_sz & ~31u));
 
     /* Halt the JPEG datapath, point WDMA2 at our buffer, install one-shot
      * callback, then bring up Sensor->INP->WDMA2. */
@@ -869,6 +1137,12 @@ ma_err_t drv_ov5647_raw_dump(drv_raw_dump_result_t* out) {
         ret = MA_ETIMEOUT;
         goto restore_cb;
     }
+
+    /* v0.4.5: WDMA wrote the frame via DMA, bypassing the DCache. Invalidate
+     * the buffer range so the CPU scan below reads the DMA'd frame data, not
+     * stale cached lines (the 0xAA fill). Address and size are 32-byte
+     * aligned (DCache line size). */
+    hx_InvalidateDCache_by_Addr((volatile void*)buf, (int32_t)(buf_sz & ~31u));
 
     /* Measure actual bytes written: scan back over the 0xAA fill. */
     uint32_t n = buf_sz;

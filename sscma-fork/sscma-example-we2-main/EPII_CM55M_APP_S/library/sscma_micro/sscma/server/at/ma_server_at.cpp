@@ -9,17 +9,31 @@
 #include "callback/algorithm.hpp"
 #include "callback/common.hpp"
 #include "callback/config.hpp"
+#include "callback/crop.hpp"
 #include "callback/info.hpp"
 #include "callback/invoke.hpp"
 #include "callback/model.hpp"
 #include "callback/mqtt.hpp"
 #include "callback/rawdump.hpp"
+#ifdef CAPTURE_ONLY_MODE
+#include "callback/rawread.hpp"
+#endif
 #include "callback/resource.hpp"
+#include "callback/watcher_build_hash.h"
 #include "callback/roi.hpp"
 #include "callback/sample.hpp"
 #include "callback/sensor.hpp"
+#include "callback/spidump.hpp"
 #include "callback/wifi.hpp"
 #include "callback/trigger.hpp"
+
+/* v0.4.8: SPI-slave housekeeping (deferred DMA diagnostics + RX re-arm retry).
+ * Resolves via -I./library/sscma_micro_porting/porting/himax/we2. */
+#include <ma_transport_spi.h>
+
+#ifdef CAPTURE_ONLY_MODE
+#include <FreeRTOS.h>
+#endif
 
 
 namespace ma {
@@ -65,7 +79,7 @@ void ATServer::threadEntry() {
         initDefaultROI(m_encoder);
         initDefaultSensor(m_encoder);
 #ifdef CAPTURE_ONLY_MODE
-        /* v0.4.4 experimental: skip model init (no TFLM engine). */
+        /* v0.4.5: skip model init (no TFLM engine). */
         MA_LOGD(MA_TAG, "Capture-only mode: skipping INIT@MODEL");
 #else
         initDefaultModel(m_encoder);
@@ -91,6 +105,12 @@ void ATServer::threadEntry() {
                 }
             }
         }
+        /* v0.4.8: SPI-slave housekeeping — deferred DMA diagnostics + RX DMA
+         * re-arm retry from thread context. Previously only called from the
+         * Edge Impulse app loop; the sscma build never called it, so a failed
+         * RX arm stayed disarmed (dead SPI RX) until reboot, and DMA
+         * diagnostics were never printed. */
+        spi_poll();
         Thread::sleep(Tick::fromMicroseconds(20));
     }
     delete[] buf;
@@ -162,6 +182,15 @@ ma_err_t ATServer::init() {
 
     this->addService("MODEL", "Set current model", "MODEL_ID", [](std::vector<std::string> args, Transport& transport, Encoder& encoder) {
         static_resource->executor->submit([args = std::move(args), &transport, &encoder](const std::atomic<bool>&) {
+#ifdef CAPTURE_ONLY_MODE
+            /* v0.4.5: the TFLM engine is not initialized in capture-only
+             * builds; engine->load() would touch uninitialized state. */
+            encoder.begin(MA_MSG_TYPE_RESP, MA_ENOTSUP, args[0]);
+            encoder.write("error", "not available in capture-only build");
+            encoder.end();
+            transport.send(reinterpret_cast<const char*>(encoder.data()), encoder.size());
+            return;
+#endif
             static_resource->current_task_id += 1;
             configureModel(args, transport, encoder);
         });
@@ -217,6 +246,47 @@ ma_err_t ATServer::init() {
         return MA_OK;
     });
 
+#ifdef CAPTURE_ONLY_MODE
+    /* v0.4.5: chunked bulk transfer of the full-frame raw capture buffer.
+     * Flow: AT+SENSOR=0,1,8 -> AT+RAWDUMP -> AT+RAWREAD=<off>,<len> x N. */
+    addService("RAWREAD", "Read chunk of raw capture buffer (base64)", "OFFSET,LEN", [](std::vector<std::string> args, Transport& transport, Encoder& encoder) {
+        static_resource->executor->submit([args = std::move(args), &transport, &encoder](const std::atomic<bool>&) {
+            static_resource->current_task_id += 1;
+            rawRead(args, transport, encoder);
+        });
+        return MA_OK;
+    });
+
+    /* v0.4.14 (P1): SPI bulk frame dump. Captures one frame, hashes it
+     * (SHA-256), stages it for the bulk feeder; the S3 then drains it
+     * with CMD_START / CMD_READ_CRC / CMD_STOP.
+     * Flow: AT+SENSOR=0,1,8 -> AT+SPIDUMP -> (S3 bulk transfer). */
+    addService("SPIDUMP", "Capture frame + stage for SPI bulk read (len, sha256)", "", [](std::vector<std::string> args, Transport& transport, Encoder& encoder) {
+        static_resource->executor->submit([args = std::move(args), &transport, &encoder](const std::atomic<bool>&) {
+            static_resource->current_task_id += 1;
+            spiDump(args, transport, encoder);
+        });
+        return MA_OK;
+    });
+
+    /* v0.4.15 (P4/P5): one-shot native-resolution crop window.
+     * AT+CROP=x,y,w,h enters 2592x1944 full-res mode and captures the
+     * window 1:1; AT+CROP=0,0,0,0 exits back to the 1296x972 raw preset.
+     * Flow: AT+CROP=0,<y0>,2592,486 -> AT+SPIDUMP (per strip). */
+    addService("CROP?", "Get active full-res crop window", "", [](std::vector<std::string> args, Transport& transport, Encoder& encoder) {
+        static_resource->executor->submit([args = std::move(args), &transport, &encoder](const std::atomic<bool>&) { getCrop(args, transport, encoder); });
+        return MA_OK;
+    });
+
+    addService("CROP", "Set full-res crop window (one-shot, not persisted)", "X,Y,W,H", [](std::vector<std::string> args, Transport& transport, Encoder& encoder) {
+        static_resource->executor->submit([args = std::move(args), &transport, &encoder](const std::atomic<bool>&) {
+            static_resource->current_task_id += 1;
+            setCrop(args, transport, encoder);
+        });
+        return MA_OK;
+    });
+#endif
+
     addService("SAMPLE", "Sample sensor data", "N_TIMES", [](std::vector<std::string> args, Transport& transport, Encoder& encoder) {
         static_resource->executor->submit([args = std::move(args), &transport, &encoder](const std::atomic<bool>&) {
             static_resource->current_task_id += 1;
@@ -227,6 +297,15 @@ ma_err_t ATServer::init() {
 
     addService("INVOKE", "Invoke model", "N_TIMES,RESULTS_ONLY", [](std::vector<std::string> args, Transport& transport, Encoder& encoder) {
         static_resource->executor->submit([args = std::move(args), &transport, &encoder](const std::atomic<bool>&) {
+#ifdef CAPTURE_ONLY_MODE
+            /* v0.4.5: the TFLM engine is not initialized in capture-only
+             * builds; inference would touch uninitialized state. */
+            encoder.begin(MA_MSG_TYPE_RESP, MA_ENOTSUP, args[0]);
+            encoder.write("error", "not available in capture-only build");
+            encoder.end();
+            transport.send(reinterpret_cast<const char*>(encoder.data()), encoder.size());
+            return;
+#endif
             static_resource->current_task_id += 1;
             Invoke::create(args, transport, encoder, static_resource->current_task_id)->run();
         });

@@ -8,6 +8,13 @@
 
 #include <atomic>
 
+#ifdef CAPTURE_ONLY_MODE
+/* v0.4.6: explicit firmware/build identifier for the experimental
+ * capture-only build (TFLM engine not initialized). Reported via AT+VER?
+ * and at boot. Defined in watcher_build_hash.h (single source of truth). */
+#include "watcher_build_hash.h"
+#endif
+
 using namespace ma;
 
 namespace ma::server::callback {
@@ -72,5 +79,28 @@ struct StaticResource final {
 };
 
 #define static_resource StaticResource::getInstance()
+
+/* v0.4.7: broadcast a just-encoded INIT event to every transport except the
+ * front one. The initDefault*() routines configure hardware through the
+ * front (console) transport and the configure*() call emits the INIT@*
+ * announcement only there; the S3 link watches the SPI transport for INIT@*
+ * as connection evidence, so without this rebroadcast the S3 never sees the
+ * Himax come up. Call immediately after the configure*() call returns: the
+ * encoder still holds the event bytes (data()/size()) until its next
+ * begin(). */
+inline void broadcastInitEvent(Encoder& encoder) {
+    const auto& transports = static_resource->device->getTransports();
+    if (transports.size() < 2) {
+        return;
+    }
+    const char* data = reinterpret_cast<const char*>(encoder.data());
+    const size_t size = encoder.size();
+    for (size_t i = 1; i < transports.size(); ++i) {
+        Transport* t = transports[i];
+        if (t && *t) {
+            t->send(data, size);
+        }
+    }
+}
 
 }  // namespace ma::server::callback

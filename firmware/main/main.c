@@ -9,8 +9,10 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "hal/wdt_hal.h"
 #include "nvs_flash.h"
 #include "cJSON.h"
@@ -18,6 +20,7 @@
 #include "net.h"
 #include "hid_ble.h"
 #include "eyes.h"
+#include "png_crash_detector.h"
 #include "display.h"
 #include "touch.h"
 #include "wheel.h"
@@ -29,19 +32,223 @@
 #include "wakeword.h"
 
 static const char *TAG = "main";
-#define FW_VERSION "0.4.12"
+#define FW_VERSION "0.4.23"
+
+/* v0.4.18.72 (Claude btmon 2026-10-08): BLE GAP callbacks run in the NimBLE
+ * host task context. Doing I/O there (display, link_send, MQTT) blocks the
+ * host task, causing SMP Pairing Requests to go unanswered → 30s timeout →
+ * disconnect. This queue makes on_ble_event fully async: the callback just
+ * queues (non-blocking) and returns; ble_evt_task does the work.
+ *
+ * v0.4.18.75 (NCP-1): Extended from bool to struct to carry pairing prompt
+ * events (PAIR_SHOW/PAIR_HIDE) alongside connect/disconnect. */
+typedef enum {
+    BLE_EVT_CONN,
+    BLE_EVT_DISC,
+    BLE_EVT_PAIR_NUMCMP,
+    BLE_EVT_PAIR_PASSKEY,
+    BLE_EVT_PAIR_CONSENT,
+    BLE_EVT_PAIR_DISMISS,
+} ble_evt_kind_t;
+
+typedef struct {
+    ble_evt_kind_t kind;
+    uint32_t gen;   /* pairing generation (for PAIR_SHOW/HIDE) */
+    uint32_t num;   /* 6-digit comparison number (for PAIR_SHOW) */
+} ble_evt_t;
+
+static QueueHandle_t ble_evt_q_ = NULL;
+
+/* NCP-1 revC: Pairing timeout kinds.
+ * NC prompt: 25s (< 30s SMP budget) → auto-reject.
+ * Passkey prompt: 35s dismiss-only (SMP handles timeout; we just hide stale UI).
+ * Consent prompt: 60s (no protocol deadline) → auto-reject. */
+typedef enum {
+    PAIR_TIMEOUT_NC,
+    PAIR_TIMEOUT_PASSKEY,
+    PAIR_TIMEOUT_CONSENT,
+} pair_timeout_kind_t;
+
+/* NCP-1: Pairing timeout (one-shot esp_timer). Generation-guarded. */
+static esp_timer_handle_t pair_timer_ = NULL;
+static uint32_t pair_timer_gen_ = 0;
+static pair_timeout_kind_t pair_timer_kind_ = PAIR_TIMEOUT_NC;
+
+/* NCP-1 revB: Pairing input via touchscreen buttons (see display.c).
+ * Wheel arming removed — John prefers touchscreen Yes/No for the ceremony. */
+
+static void pair_timeout_cb(void *arg)
+{
+    (void)arg;
+    /* Use the generation and kind captured when the timer was started. */
+    uint32_t gen = pair_timer_gen_;
+    if (pair_timer_kind_ == PAIR_TIMEOUT_PASSKEY) {
+        /* NCP-1 revC: Passkey timeout is dismiss-only. The SMP 30s window
+         * handles the actual failure; we just hide a stale modal. */
+        ESP_LOGW("BLE", "passkey modal timeout (gen=%u), dismissing",
+                 (unsigned)gen);
+        if (ble_evt_q_) {
+            ble_evt_t e = { .kind = BLE_EVT_PAIR_DISMISS, .gen = gen, .num = 0 };
+            xQueueSend(ble_evt_q_, &e, 0);
+        }
+    } else {
+        const char *kind_str = (pair_timer_kind_ == PAIR_TIMEOUT_CONSENT)
+                               ? "consent" : "numcmp";
+        ESP_LOGW("BLE", "%s timeout (gen=%u), auto-rejecting",
+                 kind_str, (unsigned)gen);
+        hid_ble_pair_confirm(gen, false);
+        /* Dismiss UI via queue. */
+        if (ble_evt_q_) {
+            ble_evt_t e = { .kind = BLE_EVT_PAIR_DISMISS, .gen = gen, .num = 0 };
+            xQueueSend(ble_evt_q_, &e, 0);
+        }
+        /* Telemetry: timeout (number never sent). */
+        cJSON *o = link_new_event("ble_pair");
+        cJSON_AddStringToObject(o, "kind", kind_str);
+        cJSON_AddStringToObject(o, "state", "timeout");
+        cJSON_AddNumberToObject(o, "gen", gen);
+        link_send(o);
+    }
+}
+
+static void ble_evt_task(void *arg)
+{
+    (void)arg;
+    ble_evt_t evt;
+    while (1) {
+        if (xQueueReceive(ble_evt_q_, &evt, portMAX_DELAY) == pdTRUE) {
+            switch (evt.kind) {
+            case BLE_EVT_CONN:
+                /* v0.4.18.73: LED updates moved here from gap_event_cb.
+                 * They use portMAX_DELAY locks which would block the NimBLE
+                 * host task. Safe here in our own task context. */
+                led_clear_state(LED_STATE_BLE_ADVERTISING);
+                led_flash_green();
+                display_set_ble(true);
+                {
+                    cJSON *o = link_new_event("ble");
+                    cJSON_AddStringToObject(o, "state", "connected");
+                    link_send(o);
+                }
+                break;
+            case BLE_EVT_DISC:
+                display_set_ble(false);
+                {
+                    cJSON *o = link_new_event("ble");
+                    cJSON_AddStringToObject(o, "state", "disconnected");
+                    link_send(o);
+                }
+                break;
+            case BLE_EVT_PAIR_NUMCMP:
+                /* NCP-1 revB: Show NC modal with 6-digit number, 25s timeout.
+                 * Touchscreen Accept/Reject buttons (no wheel needed). */
+                display_pair_show(DISPLAY_PAIR_NUMCMP, evt.gen, evt.num);
+                pair_timer_gen_ = evt.gen;
+                pair_timer_kind_ = PAIR_TIMEOUT_NC;
+                esp_timer_start_once(pair_timer_, 25000000);
+                {
+                    cJSON *o = link_new_event("ble_pair");
+                    cJSON_AddStringToObject(o, "kind", "numcmp");
+                    cJSON_AddStringToObject(o, "state", "prompt");
+                    cJSON_AddNumberToObject(o, "gen", evt.gen);
+                    link_send(o);
+                }
+                break;
+            case BLE_EVT_PAIR_PASSKEY:
+                /* NCP-1 revC: Show passkey (host types it), no local confirm.
+                 * 35s dismiss-only fallback timer (SMP 30s handles failure). */
+                display_pair_show(DISPLAY_PAIR_PASSKEY, evt.gen, evt.num);
+                /* No input arm — display-only role. Dismissed by ENC_CHANGE. */
+                pair_timer_gen_ = evt.gen;
+                pair_timer_kind_ = PAIR_TIMEOUT_PASSKEY;
+                esp_timer_start_once(pair_timer_, 35000000);
+                {
+                    cJSON *o = link_new_event("ble_pair");
+                    cJSON_AddStringToObject(o, "kind", "passkey");
+                    cJSON_AddStringToObject(o, "state", "prompt");
+                    cJSON_AddNumberToObject(o, "gen", evt.gen);
+                    /* Never send the passkey number (revC §0 hard rule). */
+                    link_send(o);
+                }
+                break;
+            case BLE_EVT_PAIR_CONSENT:
+                /* NCP-1 revB: Show consent modal (amber, no number), 60s timeout.
+                 * Touchscreen Accept/Reject buttons. */
+                display_pair_show(DISPLAY_PAIR_CONSENT, evt.gen, 0);
+                pair_timer_gen_ = evt.gen;
+                pair_timer_kind_ = PAIR_TIMEOUT_CONSENT;
+                esp_timer_start_once(pair_timer_, 60000000);
+                {
+                    cJSON *o = link_new_event("ble_pair");
+                    cJSON_AddStringToObject(o, "kind", "consent");
+                    cJSON_AddStringToObject(o, "state", "prompt");
+                    cJSON_AddNumberToObject(o, "gen", evt.gen);
+                    link_send(o);
+                }
+                break;
+            case BLE_EVT_PAIR_DISMISS:
+                /* NCP-1 revB: Dismiss any pairing modal. */
+                esp_timer_stop(pair_timer_);
+                display_pair_hide();
+                break;
+            }
+        }
+    }
+}
 
 static void on_ble_event(bool connected)
 {
-    display_set_ble(connected);
-    cJSON *o = link_new_event("ble");
-    cJSON_AddStringToObject(o, "state", connected ? "connected" : "disconnected");
-    link_send(o);
+    /* v0.4.18.72: Async only. Queue the event (non-blocking, drop if full)
+     * and return immediately. Never do I/O in the NimBLE host task. */
+    if (ble_evt_q_) {
+        ble_evt_t e = {
+            .kind = connected ? BLE_EVT_CONN : BLE_EVT_DISC,
+            .gen = 0,
+            .num = 0,
+        };
+        xQueueSend(ble_evt_q_, &e, 0);
+    }
 }
 
-static void on_snaptest_chunk(int id, const char *mid, int seq, int total,
+/* NCP-1 revB: Pairing UI callback from hid_ble (runs in NimBLE host task).
+ * Queue-only, never block. */
+static void on_ble_pair_ui(uint32_t gen, hid_ble_pair_ui_t what, uint32_t number)
+{
+    if (ble_evt_q_) {
+        ble_evt_kind_t kind;
+        switch (what) {
+        case HID_BLE_PAIR_UI_NUMCMP:  kind = BLE_EVT_PAIR_NUMCMP;  break;
+        case HID_BLE_PAIR_UI_PASSKEY: kind = BLE_EVT_PAIR_PASSKEY; break;
+        case HID_BLE_PAIR_UI_CONSENT: kind = BLE_EVT_PAIR_CONSENT; break;
+        case HID_BLE_PAIR_UI_DISMISS:
+        default:                      kind = BLE_EVT_PAIR_DISMISS; break;
+        }
+        ble_evt_t e = { .kind = kind, .gen = gen, .num = number };
+        if (xQueueSend(ble_evt_q_, &e, 0) != pdTRUE) {
+            ESP_LOGW("BLE", "pair UI event dropped (queue full)");
+        }
+    }
+}
+
+static bool on_snaptest_chunk(int id, const char *mid, int seq, int total,
                               const char *b64)
 {
+    /* v0.4.18.81 (John 2026-10-08): Watermark flow control. Block until
+     * ring has space — paces the PNG encoder to the USB drain rate.
+     * v0.4.18.84: 60s timeout per chunk (generous; 800KB at 115200 takes
+     * ~45s total). Blocking is correct here — this is the one place where
+     * backpressure should apply.
+     * v0.4.18.84 (John 2026-10-08): Return false on timeout to ABORT the
+     * entire PNG transfer. A dropped chunk corrupts the image — abort is
+     * the only safe option (fatal for the function, not a panic).
+     * v0.4.18.88 (2026-10-08): Pass exact required bytes. The old 50%
+     * watermark (6KB free) was insufficient for 11KB chunk JSONs — the
+     * ring_push_nb overwrote, truncating the base64. */
+    size_t need = strlen(b64) + 128;  /* b64 + JSON overhead */
+    if (!link_wait_for_ring_space(60000, need)) {
+        ESP_LOGE("main", "snaptest: ring stuck full, ABORTING PNG transfer at chunk %d", seq);
+        return false;
+    }
     cJSON *o = link_new_event("snaptest_chunk");
     cJSON_AddNumberToObject(o, "id", id);
     if (mid && mid[0]) {
@@ -49,7 +256,64 @@ static void on_snaptest_chunk(int id, const char *mid, int seq, int total,
     }
     cJSON_AddNumberToObject(o, "seq", seq);
     cJSON_AddNumberToObject(o, "total", total);
+    /* v0.4.18.70 (Claude F6e): Removed "last" field. In streaming mode
+     * total=-1, so seq==total-1 is never true. Page uses IEND chunk. */
+    /* v0.4.21: blen = expected b64 length, so receivers can pinpoint a
+     * truncated chunk deterministically (chunk-loss RCA 2026-11-02). */
+    cJSON_AddNumberToObject(o, "blen", (double)strlen(b64));
+    cJSON_AddStringToObject(o, "b64", b64);
+    /* v0.4.21: a failed send (ring push dropped the line) aborts the
+     * encode — never silently ship a holed image. */
+    if (link_send(o) != ESP_OK) {
+        ESP_LOGE("main", "snaptest: chunk %d send failed, ABORTING PNG transfer", seq);
+        return false;
+    }
+    return true;
+}
+
+/* v0.4.14 (P2): PNG capture chunks -> {t:"png_chunk"} events. */
+static bool on_png_chunk(int seq, int total, const char *b64)
+{
+    /* v0.4.18.81: Watermark flow control (see on_snaptest_chunk).
+     * v0.4.18.84: 60s timeout, blocking is correct.
+     * v0.4.18.84 (John 2026-10-08): Return false on timeout to ABORT.
+     * A dropped chunk corrupts the PNG.
+     * v0.4.18.88: Pass exact required bytes (see on_snaptest_chunk). */
+    size_t need = strlen(b64) + 128;
+    if (!link_wait_for_ring_space(60000, need)) {
+        ESP_LOGE("main", "dbg png: ring stuck full, ABORTING PNG transfer at chunk %d", seq);
+        return false;
+    }
+    cJSON *o = link_new_event("png_chunk");
+    cJSON_AddNumberToObject(o, "seq", seq);
+    cJSON_AddNumberToObject(o, "total", total);
     cJSON_AddBoolToObject(o, "last", seq == total - 1);
+    /* v0.4.21: blen + send-failure abort (see on_snaptest_chunk). */
+    cJSON_AddNumberToObject(o, "blen", (double)strlen(b64));
+    cJSON_AddStringToObject(o, "b64", b64);
+    if (link_send(o) != ESP_OK) {
+        ESP_LOGE("main", "dbg png: chunk %d send failed, ABORTING PNG transfer", seq);
+        return false;
+    }
+    return true;
+}
+
+/* v0.4.15 (P5): strip capture chunks -> {t:"strip_chunk"} events.
+ * The host reassembles strips (in order) into the 2592x1944 frame. */
+static void on_strip_chunk(uint32_t strip_idx, uint32_t strip_count,
+                           uint32_t y0, uint32_t h,
+                           uint32_t seq, uint32_t total,
+                           const char *b64)
+{
+    cJSON *o = link_new_event("strip_chunk");
+    cJSON_AddNumberToObject(o, "strip_idx", strip_idx);
+    cJSON_AddNumberToObject(o, "strip_count", strip_count);
+    cJSON_AddNumberToObject(o, "y0", y0);
+    cJSON_AddNumberToObject(o, "h", h);
+    cJSON_AddNumberToObject(o, "seq", seq);
+    cJSON_AddNumberToObject(o, "total", total);
+    cJSON_AddBoolToObject(o, "last",
+                          strip_idx == strip_count - 1 && seq == total - 1);
     cJSON_AddStringToObject(o, "b64", b64);
     link_send(o);
 }
@@ -180,11 +444,34 @@ void app_main(void)
         return;
     }
     link_set_fw_version(FW_VERSION);
+    /* v0.4.18.65 (John 2026-10-08): Report PNG crash AFTER link_init so it
+     * goes via MQTT telemetry, not just USB serial. The RTC flag survives
+     * reboot; we need to see it even if USB wasn't connected. */
+    png_crash_detector_report();
+    /* v0.4.18.72: Create BLE event queue and task before registering callback.
+     * The callback runs in NimBLE host task; it must not do I/O.
+     * v0.4.18.75 (NCP-1): Queue carries ble_evt_t (conn/disc/pair events). */
+    ble_evt_q_ = xQueueCreate(8, sizeof(ble_evt_t));
+    if (ble_evt_q_) {
+        xTaskCreate(ble_evt_task, "ble_evt", 4096, NULL, 5, NULL);
+    }
+    /* NCP-1: Pairing timeout timer (25s, one-shot). */
+    {
+        const esp_timer_create_args_t args = {
+            .callback = pair_timeout_cb,
+            .arg = NULL,
+            .name = "pair_tmo",
+        };
+        esp_timer_create(&args, &pair_timer_);
+    }
     hid_ble_set_event_cb(on_ble_event);
+    hid_ble_set_pair_ui_cb(on_ble_pair_ui);
     net_set_event_cb(on_net_event);
     eyes_set_emit(on_eyes_emit);
     eyes_set_snaptest_cb(on_snaptest_done);
     eyes_set_snaptest_chunk_cb(on_snaptest_chunk);
+    eyes_set_png_chunk_cb(on_png_chunk);
+    eyes_set_strip_chunk_cb(on_strip_chunk);
 
     if (net_init() != ESP_OK) {
         ESP_LOGE(TAG, "network init failed (continuing without Wi-Fi)");

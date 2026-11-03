@@ -1,0 +1,9 @@
+--- /home/hatch/workspace/projects/watcher-input-assistant/host-agent/mqtt-bridge/bridge-watchdog.sh	2026-10-05 16:33:22.327275900 +0000
++++ bridge-watchdog.sh	2026-10-18 16:06:37.899194116 +0000
+@@ -37,5 +37,5 @@
+ PYTHON="$(command -v python3)"
+ # 9>&-: don't let the child inherit the lock FD; the lock is only ever held
+ # briefly by watchdog runs, never for the subscriber's whole lifetime.
+-nohup "$PYTHON" subscriber.py >> subscriber.log 2>&1 9>&- &
++nohup "$BRIDGE_DIR/subscriber-supervised.sh" >> subscriber.log 2>&1 9>&- &
+ echo "$NOW restarted subscriber.py pid $!" >> "$LOG"

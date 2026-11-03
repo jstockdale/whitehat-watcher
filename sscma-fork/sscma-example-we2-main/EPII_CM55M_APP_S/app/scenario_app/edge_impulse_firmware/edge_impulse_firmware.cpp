@@ -9,6 +9,7 @@
 #include "firmware-sdk/at-server/ei_at_server.h"
 #include "ethosu_driver.h"
 #include "WE2_core.h"
+#include <porting/himax/we2/ma_transport_spi.h>  // v0.4.6.1: ma::spi_poll()
 extern "C" {
 	#include "hx_drv_pmu.h"
 	#include "timer_interface.h"
@@ -115,6 +116,10 @@ extern "C" int edge_impulse_app(void)
 		if(is_inference_running() == true) {
 			ei_run_impulse();
 		}
+
+		/* v0.4.6.1: thread-context SPI housekeeping — prints deferred
+		 * DMA-failure diagnostics and retries a failed RX arm. */
+		ma::spi_poll();
 
 		hx_drv_timer_cm55x_delay_ms(1, TIMER_STATE_DC);
 	}

@@ -62,7 +62,7 @@ TOPIC_PREFIX = os.environ.get("MQTT_TOPIC") or "watcher"
 
 DBG_ALLOWED = {"version", "mem", "heap", "tasks", "pwr", "i2c",
                "touch", "wheel", "pointer", "spitest",
-               "eyes", "at", "snaptest"}
+               "eyes", "at", "snaptest", "png", "crop", "strip"}
 
 # HID input class: approved by John 2026-09-23 for the eyes-drive-cursor
 # loop. Standing rule: NEVER send one without his explicit per-use
@@ -74,8 +74,10 @@ HID_ALLOWED = {"hid_status", "mouse_move", "mouse_glide", "mouse_wheel",
 
 
 def allowed(cmd) -> bool:
-    """Mirror of the console's authorized-list check. Read-only, plus the
-    HID input class (John-approved 2026-09-23, per-use permission only)."""
+    """Mirror of the console's COMMAND_REGISTRY check (watcher-console.html).
+    CANONICAL SOURCE: watcher-console.html::COMMAND_REGISTRY.
+    Keep this in sync when adding new command types there.
+    Read-only, plus the HID input class (John-approved 2026-09-23, per-use permission only)."""
     if not isinstance(cmd, dict):
         return False
     t = cmd.get("t")
@@ -91,6 +93,17 @@ def allowed(cmd) -> bool:
                 and not any(k in cmd for k in ("on", "v", "color")))
     if t in HID_ALLOWED:
         return True
+    if t == "himax_at":
+        at = cmd.get("at")
+        return (set(cmd.keys()) == {"t", "at"}
+                and isinstance(at, str)
+                and at.startswith("AT"))
+    if t == "himax_at_batch":
+        ats = cmd.get("ats")
+        return (set(cmd.keys()) <= {"t", "ats", "_mid"}
+                and isinstance(ats, list)
+                and len(ats) > 0
+                and all(isinstance(a, str) and a.startswith("AT") for a in ats))
     return False
 
 
@@ -119,6 +132,10 @@ def parse_args(argv):
         "--no-seal", dest="seal", action="store_false",
         help="legacy alias for --unkeyed (same behavior).")
     p.add_argument("command", help='JSON command, e.g. \'{"t":"ping"}\'')
+    p.add_argument("--timeout", type=int, default=12,
+        help="seconds to wait for replies (default 12; use 3-5 for fast himax_at)")
+    p.add_argument("--batch", action="store_true",
+        help="command JSON contains 'ats' array for himax_at_batch (sends as t:himax_at_batch)")
     return p.parse_args(argv)
 
 
@@ -127,6 +144,8 @@ def main() -> None:
     use_seal = opts.seal
     try:
         cmd = json.loads(opts.command)
+        if opts.batch and "ats" in cmd:
+            cmd["t"] = "himax_at_batch"
     except json.JSONDecodeError as e:
         print(f"not valid JSON: {e}")
         sys.exit(2)
@@ -205,8 +224,8 @@ def main() -> None:
     print(f"sent id={cmd_id}{sealed_info} "
           f"[{'SEALED' if use_seal else 'UNSEALED'}]: {envelope[:120]}"
           f"{'...' if len(envelope) > 120 else ''}")
-    print("--- waiting for replies (12s) ---")
-    deadline = time.time() + 12
+    print(f"--- waiting for replies ({opts.timeout}s) ---")
+    deadline = time.time() + opts.timeout
     while time.time() < deadline:
         time.sleep(0.5)
     client.loop_stop()

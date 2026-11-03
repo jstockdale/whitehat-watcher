@@ -49,6 +49,24 @@ python3 -c "from eyes_fast import EyesLink; l=EyesLink(); l._send_cmd({'t':'hid_
   (EnvironmentFile with 600 perms, or a secrets manager).
 - Muse MUST NOT store MQTT_PASS in memory, files, or logs.
 
+## Auto-recovery (cron watchdog, added 2026-10-04)
+
+No systemd user bus exists in this environment, so the systemd path above
+can't work here. Instead:
+
+- `bridge-watchdog.sh` (same dir): revives `subscriber.py` if the process
+  is gone, sourcing `~/.config/watcher-mqtt.env` — the same file used for
+  manual restarts. Exits quietly when the bridge is alive; appends
+  restarts to `watchdog.log`; never prints credentials. Uses an anchored
+  pgrep pattern (`^python3 subscriber\.py`) and a flock guard so it can't
+  double-start.
+- Cron `bridge-watchdog` (interval 1m): runs the script, stays quiet on
+  no-op, verifies a restart via pgrep + subscriber.log tail.
+- Per John's standing rule (2026-09-30): the bridge should just come up
+  automatically when we're on the bench together. subscriber.py died twice
+  silently on 2026-10-04 with no traceback; the revive path is log-verified
+  on paper only — check `watchdog.log` if it ever fires for real.
+
 ## Keep-alive Contract (John's rule 2026-09-23)
 Once the bridge is up, run:
 ```bash

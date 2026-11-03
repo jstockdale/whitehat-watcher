@@ -23,6 +23,7 @@
 
 #include "sscma_client_types.h"
 #include "sscma_client_io.h"
+#include "sscma_client_io_interface.h"
 #include "sscma_client_flasher.h"
 #include "sscma_client_commands.h"
 #include "sscma_client_ops.h"
@@ -169,7 +170,7 @@ static void sscma_monitor(void *arg)
         if (client->on_connect)
         {
             cJSON *name = cJSON_GetObjectItem(reply.payload, "name");
-            if (name != NULL && strnstr(name->valuestring, EVENT_INIT, strlen(name->valuestring)) != NULL)
+            if (name != NULL && strncmp(name->valuestring, EVENT_INIT_PREFIX, strlen(EVENT_INIT_PREFIX)) == 0)
             {
                 client->on_connect(client, &reply, client->user_ctx);
                 sscma_client_reply_clear(&reply);
@@ -212,9 +213,18 @@ static void sscma_client(void *arg)
     sscma_client_reply_t reply;
     while (true)
     {
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        /* Phase 1 (v0.4.14): 1 ms AT poll interval (was 10 ms). Bulk
+         * transfers use sscma_client_read_bulk() and bypass this loop. */
+        vTaskDelay(pdMS_TO_TICKS(1));
         if (client->inited == false)
         {
+            continue;
+        }
+        /* v0.4.14 (P1): a bulk transfer holds the bus; skip polling instead
+         * of blocking on the io lock (which the bulk path holds throughout). */
+        if (client->bulk_active)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
         if (sscma_client_available(client, &rlen) == ESP_OK && rlen)
@@ -225,6 +235,18 @@ static void sscma_client(void *arg)
                 if (rlen <= 0)
                 {
                     ESP_LOGW(TAG, "rx buffer is full");
+                    /* v0.4.18.18 DIAG: dump first 256 bytes in hex to see
+                     * what the Himax is actually sending. */
+                    {
+                        char hex[513];
+                        int n = client->rx_buffer.pos > 256 ? 256 : client->rx_buffer.pos;
+                        for (int i = 0; i < n; i++) {
+                            hex[i*2] = "0123456789abcdef"[(client->rx_buffer.data[i] >> 4) & 0xF];
+                            hex[i*2+1] = "0123456789abcdef"[client->rx_buffer.data[i] & 0xF];
+                        }
+                        hex[n*2] = 0;
+                        ESP_LOGW(TAG, "rxbuf hex[0..%d]: %s", n, hex);
+                    }
                     client->rx_buffer.pos = 0;
                     continue;
                 }
@@ -260,7 +282,21 @@ static void sscma_client(void *arg)
             client->rx_buffer.data[client->rx_buffer.pos] = 0;
             while ((suffix = strnstr(client->rx_buffer.data, RESPONSE_SUFFIX, client->rx_buffer.pos)) != NULL)
             {
-                if ((prefix = strnstr(client->rx_buffer.data, RESPONSE_PREFIX, suffix - client->rx_buffer.data)) != NULL)
+                /* v0.4.18.44: Find the NEAREST prefix before the suffix, not the first.
+                 * The old code used strnstr from the buffer start, which found the first
+                 * \r{ even if there were multiple concatenated responses (or a stale
+                 * fragment). This caused invalid JSON when a stale fragment preceded
+                 * a valid response. Scan backwards from suffix to find the nearest. */
+                prefix = NULL;
+                for (char *p = suffix - RESPONSE_PREFIX_LEN; p >= client->rx_buffer.data; p--) {
+                    if (memcmp(p, RESPONSE_PREFIX, RESPONSE_PREFIX_LEN) == 0) {
+                        prefix = p;
+                        break;
+                    }
+                    /* Don't scan too far back — responses are < 4KB */
+                    if (suffix - p > 4096) break;
+                }
+                if (prefix != NULL)
                 {
                     int len = suffix - prefix + RESPONSE_SUFFIX_LEN;
                     reply.data = (char *)__malloc(len + 1);
@@ -287,17 +323,22 @@ static void sscma_client(void *arg)
                                 continue;
                             }
 
-                            if (client->on_connect)
+                            /* v0.4.14 (P0.2): INIT@* broadcasts always route to the
+                             * reply queue, whether or not an on_connect
+                             * callback is registered. The monitor task drops
+                             * them silently when on_connect is NULL; when it
+                             * is set they reach it via the normal path. This
+                             * keeps the S3-side reboot detector (eyes.c)
+                             * working even if the callback is registered
+                             * after client init. */
+                            if (name != NULL && strncmp(name->valuestring, EVENT_INIT_PREFIX, strlen(EVENT_INIT_PREFIX)) == 0)
                             {
-                                if (name != NULL && strnstr(name->valuestring, EVENT_INIT, strlen(name->valuestring)) != NULL)
+                                xQueueReset(client->reply_queue); // reset reply queue
+                                if (xQueueSend(client->reply_queue, &reply, 0) != pdTRUE)
                                 {
-                                    xQueueReset(client->reply_queue); // reset reply queue
-                                    if (xQueueSend(client->reply_queue, &reply, 0) != pdTRUE)
-                                    {
-                                        sscma_client_reply_clear(&reply);
-                                    }
-                                    continue;
+                                    sscma_client_reply_clear(&reply);
                                 }
+                                continue;
                             }
 
                             if (type->valueint == CMD_TYPE_RESPONSE)
@@ -306,11 +347,23 @@ static void sscma_client(void *arg)
                                 bool found = false;
                                 if (listCURRENT_LIST_LENGTH(client->request_list) > (UBaseType_t)0)
                                 {
+                                    /* v0.4.14 (P2): strict FIFO — restart the scan at the
+                                     * list head so the OLDEST matching request wins, not
+                                     * wherever the round-robin cursor was left by a
+                                     * previous scan. Requests are appended with
+                                     * vListInsertEnd, so the head is the oldest waiter. */
+                                    client->request_list->pxIndex =
+                                        (ListItem_t *)&(client->request_list->xListEnd);
                                     listGET_OWNER_OF_NEXT_ENTRY(first_req, client->request_list);
                                     do
                                     {
                                         listGET_OWNER_OF_NEXT_ENTRY(next_req, client->request_list);
-                                        if (strncmp(next_req->cmd, name->valuestring, sizeof(next_req->cmd)) == 0)
+                                        /* v0.4.18.48: Use strcmp, not strncmp with sizeof(cmd).
+                                         * next_req->cmd is char[32], but name->valuestring is only
+                                         * strlen+1 bytes on the heap. strncmp with 32 reads past
+                                         * the heap allocation (23-byte over-read for "SENSORS?").
+                                         * strcmp stops at the NUL terminator. */
+                                        if (strcmp(next_req->cmd, name->valuestring) == 0)
                                         {
                                             if (next_req->reply)
                                             {
@@ -356,6 +409,10 @@ static void sscma_client(void *arg)
                                     bool found = false;
                                     if (listCURRENT_LIST_LENGTH(client->request_list) > (UBaseType_t)0)
                                     {
+                                        /* v0.4.14 (P2): strict FIFO — restart the scan at the
+                                         * list head so the OLDEST matching request wins. */
+                                        client->request_list->pxIndex =
+                                            (ListItem_t *)&(client->request_list->xListEnd);
                                         listGET_OWNER_OF_NEXT_ENTRY(first_req, client->request_list);
                                         do
                                         {
@@ -399,6 +456,13 @@ static void sscma_client(void *arg)
                                 // discard all the events while AT+BREAK is found
                                 if (listCURRENT_LIST_LENGTH(client->request_list) > (UBaseType_t)0)
                                 {
+                                    /* v0.4.14 (P2): strict FIFO — restart the scan at the
+                                     * list head so the OLDEST matching request wins, not
+                                     * wherever the round-robin cursor was left by a
+                                     * previous scan. Requests are appended with
+                                     * vListInsertEnd, so the head is the oldest waiter. */
+                                    client->request_list->pxIndex =
+                                        (ListItem_t *)&(client->request_list->xListEnd);
                                     listGET_OWNER_OF_NEXT_ENTRY(first_req, client->request_list);
                                     do
                                     {
@@ -806,9 +870,78 @@ esp_err_t sscma_client_reset(sscma_client_handle_t client)
     return ret;
 }
 
+/* v0.4.14 (P0.1): discard any stale partial frame in the RX buffer, e.g.
+ * after a Himax reboot is detected. Suspends/resumes the process task;
+ * safe to call from any task except the client's own process task. */
+esp_err_t sscma_client_flush_rx(sscma_client_handle_t client)
+{
+    if (client == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    vTaskSuspend(client->process_task.handle);
+    client->rx_buffer.pos = 0;
+    vTaskResume(client->process_task.handle);
+    return ESP_OK;
+}
+
 esp_err_t sscma_client_read(sscma_client_handle_t client, void *data, size_t size)
 {
     return sscma_client_io_read(client->io, data, size);
+}
+
+/* Phase 1 SPI optimization (v0.4.14): bulk read for known-length pulls.
+ * Loops read() in fixed chunks WITHOUT per-chunk available() polling.
+ * The wire protocol is unchanged (same FEATURE_TRANSPORT READ commands);
+ * this only skips the ~4.2 ms available() round-trip + 10 ms poll-loop
+ * delay per chunk, ~3x throughput for frame-sized transfers.
+ * Each chunk gets one retry after a short backoff so a transient SPI
+ * error doesn't abort a multi-second transfer. */
+#define SSCMA_BULK_CHUNK_SIZE 4095u
+#define SSCMA_BULK_RETRY_DELAY_MS 5u
+
+/* No in-tree caller yet (the frame-pull path will use it). Kept in the
+ * firmware image via `-Wl,-u,sscma_client_read_bulk` in CMakeLists.txt:
+ * the xtensa GCC 13.2 ignores __attribute__((retain)) and
+ * __attribute__((used)) does not survive linker --gc-sections. */
+esp_err_t sscma_client_read_bulk(sscma_client_handle_t client, void *data, size_t size)
+{
+    if (client == NULL || data == NULL || size == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* v0.4.14 (P1): prefer the transport's bulk fast path (SPI:
+     * CMD_START / CMD_READ_CRC / CMD_STOP with the bus lock held). The
+     * bulk_active hint tells the process task to skip AT polling while
+     * the bus is held. */
+    if (client->io && client->io->read_bulk)
+    {
+        client->bulk_active = true;
+        esp_err_t err = client->io->read_bulk(client->io, data, size);
+        client->bulk_active = false;
+        return err;
+    }
+    /* Fallback: chunked available()/read() loop for transports without
+     * bulk support. */
+    uint8_t *p = (uint8_t *)data;
+    size_t remaining = size;
+    while (remaining > 0)
+    {
+        size_t chunk = remaining > SSCMA_BULK_CHUNK_SIZE ? SSCMA_BULK_CHUNK_SIZE : remaining;
+        esp_err_t err = sscma_client_read(client, p, chunk);
+        if (err != ESP_OK)
+        {
+            vTaskDelay(pdMS_TO_TICKS(SSCMA_BULK_RETRY_DELAY_MS));
+            err = sscma_client_read(client, p, chunk);
+            if (err != ESP_OK)
+            {
+                return err;
+            }
+        }
+        p += chunk;
+        remaining -= chunk;
+    }
+    return ESP_OK;
 }
 
 esp_err_t sscma_client_write(sscma_client_handle_t client, const void *data, size_t size)
@@ -1158,14 +1291,44 @@ esp_err_t sscma_client_get_sensor(sscma_client_handle_t client, sscma_client_sen
             cJSON *data = cJSON_GetObjectItem(reply.payload, "data");
             if (data != NULL)
             {
+                /* v0.4.18.5: the Himax capture-only firmware emits
+                 * data.sensors[] (array) with current_preset.id, not
+                 * data.sensor.opt_id. Parse the real schema, falling back
+                 * to the legacy flat format. */
                 cJSON *o_sensor = cJSON_GetObjectItem(data, "sensor");
+                cJSON *preset_obj = NULL;
+                if (o_sensor == NULL || !cJSON_IsObject(o_sensor))
+                {
+                    /* New schema: data.sensors[0].current_preset.id */
+                    cJSON *sensors = cJSON_GetObjectItem(data, "sensors");
+                    if (sensors != NULL && cJSON_IsArray(sensors) &&
+                        cJSON_GetArraySize(sensors) > 0)
+                    {
+                        o_sensor = cJSON_GetArrayItem(sensors, 0);
+                        if (o_sensor != NULL)
+                        {
+                            preset_obj = cJSON_GetObjectItem(o_sensor, "current_preset");
+                        }
+                    }
+                }
                 if (sensor != NULL)
                 {
                     sensor->id = get_int_from_object(o_sensor, "id");
+                    /* type may be a string ("Camera") in the new schema */
                     sensor->type = get_int_from_object(o_sensor, "type");
                     sensor->state = get_int_from_object(o_sensor, "state");
-                    sensor->opt_id = get_int_from_object(o_sensor, "opt_id");
-                    fetch_string_from_object(o_sensor, "opt_detail", &(sensor->opt_detail));
+                    if (preset_obj != NULL && cJSON_IsObject(preset_obj))
+                    {
+                        sensor->opt_id = get_int_from_object(preset_obj, "id");
+                        fetch_string_from_object(preset_obj, "description",
+                                                 &(sensor->opt_detail));
+                    }
+                    else
+                    {
+                        sensor->opt_id = get_int_from_object(o_sensor, "opt_id");
+                        fetch_string_from_object(o_sensor, "opt_detail",
+                                                 &(sensor->opt_detail));
+                    }
                 }
             }
         }
