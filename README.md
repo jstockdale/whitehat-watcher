@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/assets/logo.png" alt="Watcher logo" width="120"></p>
+
 # Watcher Input Assistant
 
 **Turning a Seeed Studio SenseCAP Watcher into an AI-driven input assistant.**
@@ -17,6 +19,8 @@ and the scrolling) over BLE HID — exactly as if a person were sitting there
 with a keyboard and mouse. Every hop in that loop is fast, byte-exact, and
 cryptographically sealed, and getting it that way is most of what's in this
 repository.
+
+<p align="center"><img src="docs/assets/hero.png" alt="Nobody the lighthouse and Muse, working side by side"></p>
 
 ## What it does
 
