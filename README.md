@@ -1,5 +1,3 @@
-<p align="center"><img src="docs/assets/logo.png" alt="Watcher logo" width="120"></p>
-
 <p align="center"><img src="docs/assets/wordmark-t-small.png" alt="WATCHER wordmark — the T is Nobody, the lighthouse mascot, beams on" width="520"></p>
 
 # Watcher Input Assistant
