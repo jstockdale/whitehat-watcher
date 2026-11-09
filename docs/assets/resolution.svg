@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 1180" font-family="Verdana, Geneva, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1180" viewBox="0 0 1800 1180" font-family="Verdana, Geneva, sans-serif">
   <rect width="1800" height="1180" fill="#f6f1e7"/>
   <text x="900" y="66" text-anchor="middle" font-size="40" font-weight="bold" fill="#17323c">How much of the sensor do you get?</text>
   <text x="900" y="104" text-anchor="middle" font-size="20" fill="#4a6570">SenseCAP Watcher · OV5647 — rectangles drawn to true relative scale, sharing one corner</text>

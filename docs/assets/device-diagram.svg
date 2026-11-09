@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1680 1060" font-family="Verdana, Geneva, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="1680" height="1060" viewBox="0 0 1680 1060" font-family="Verdana, Geneva, sans-serif">
   <rect width="1680" height="1060" fill="#f6f1e7"/>
   <text x="840" y="64" text-anchor="middle" font-size="40" font-weight="bold" fill="#17323c">SenseCAP Watcher — what does what</text>
   <text x="840" y="102" text-anchor="middle" font-size="20" fill="#4a6570">One small sentinel: eyes, ears, a voice, and hands on your keyboard and mouse</text>
@@ -134,7 +134,7 @@
       <polyline points="478,415 560,360 708,248" fill="none" stroke="#17323c" stroke-width="2"/>
       <circle cx="708" cy="248" r="4.5" fill="#17323c"/>
       <text x="462" y="417" text-anchor="end" font-weight="bold" font-size="22">Status LED — state at a glance</text>
-      <text x="462" y="445" text-anchor="end">Listening · thinking · recording</text>
+      <text x="462" y="445" text-anchor="end">Idle dark · thinking · recording</text>
     </g>
     <g>
       <line x1="478" y1="540" x2="596" y2="420" stroke="#17323c" stroke-width="2"/>
@@ -194,5 +194,35 @@
     <circle cx="843" cy="838" r="5" fill="#17323c"/>
     <text x="843" y="952" text-anchor="middle" font-weight="bold" font-size="22">USB-C — CH342</text>
     <text x="843" y="980" text-anchor="middle">Console serial link + power</text>
+  </g>
+
+  <!-- ===== LED color key (states + patterns per firmware components/led/led.c) ===== -->
+  <g font-size="17" fill="#17323c">
+    <defs>
+      <linearGradient id="ledrainbow" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0" stop-color="#ff0000"/><stop offset="0.25" stop-color="#ff9a00"/>
+        <stop offset="0.5" stop-color="#ffee00"/><stop offset="0.7" stop-color="#00c800"/>
+        <stop offset="0.88" stop-color="#0050ff"/><stop offset="1" stop-color="#8b00ff"/>
+      </linearGradient>
+    </defs>
+    <text x="48" y="880" font-weight="bold" font-size="20">Status LED color key</text>
+    <circle cx="56" cy="906" r="8" fill="#ff0000" stroke="#17323c" stroke-opacity="0.35" stroke-width="1.5"/>
+    <text x="74" y="912">Error — pulsing</text>
+    <circle cx="56" cy="934" r="8" fill="#ff0000" stroke="#17323c" stroke-opacity="0.35" stroke-width="1.5"/>
+    <text x="74" y="940">Recording — steady</text>
+    <circle cx="56" cy="962" r="8" fill="#ff0000" stroke="#17323c" stroke-opacity="0.35" stroke-width="1.5"/>
+    <text x="74" y="968">Take ending — blinking</text>
+    <circle cx="56" cy="990" r="8" fill="#ffff00" stroke="#17323c" stroke-opacity="0.35" stroke-width="1.5"/>
+    <text x="74" y="996">Startup issue — pulsing</text>
+    <circle cx="56" cy="1018" r="8" fill="#0000ff" stroke="#17323c" stroke-opacity="0.35" stroke-width="1.5"/>
+    <text x="74" y="1024">Pairing — blinks 2×/sec</text>
+    <circle cx="356" cy="906" r="8" fill="#a020ff" stroke="#17323c" stroke-opacity="0.35" stroke-width="1.5"/>
+    <text x="374" y="912">AI thinking — breathing</text>
+    <circle cx="356" cy="934" r="8" fill="#00ff00" stroke="#17323c" stroke-opacity="0.35" stroke-width="1.5"/>
+    <text x="374" y="940">Working — breathing</text>
+    <circle cx="356" cy="962" r="8" fill="url(#ledrainbow)" stroke="#17323c" stroke-opacity="0.35" stroke-width="1.5"/>
+    <text x="374" y="968">Party — rainbow cycle</text>
+    <circle cx="356" cy="990" r="8" fill="#20262b" stroke="#17323c" stroke-opacity="0.35" stroke-width="1.5"/>
+    <text x="374" y="996">Idle — LED dark</text>
   </g>
 </svg>
