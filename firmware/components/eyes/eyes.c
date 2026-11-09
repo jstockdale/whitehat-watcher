@@ -1937,8 +1937,37 @@ static const char *snap_grab_frame_png_(int id, const char *mid,
     return NULL; /* success */
 }
 
+/* v0.4.49.1 diagnostic: exercise the esp_timer insert/remove path at
+ * known points inside a capture. The 0.4.49 StoreProhibited panics died
+ * in esp_timer's timer_insert walking a timer list corrupted by a stray
+ * write; if the list is already poisoned at a probe point, the fault
+ * lands HERE, attributable to the stage that ran before it, instead of
+ * in an unrelated timer callback. Also logs this task's stack
+ * high-water mark and the free internal heap at each point. */
+static void timer_probe_cb_(void *arg) { (void)arg; }
+
+static void timer_list_probe_(const char *where)
+{
+    esp_timer_handle_t probe = NULL;
+    const esp_timer_create_args_t pargs = {
+        .callback = timer_probe_cb_,
+        .name = "png_probe",
+    };
+    if (esp_timer_create(&pargs, &probe) == ESP_OK && probe) {
+        esp_timer_start_once(probe, 3600ULL * 1000000ULL);
+        esp_timer_stop(probe);
+        esp_timer_delete(probe);
+    }
+    ESP_LOGI(TAG, "timer probe ok @%s: stack_hwm=%u int_free=%u int_largest=%u",
+             where,
+             (unsigned)uxTaskGetStackHighWaterMark(NULL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
 esp_err_t eyes_capture_png(void)
 {
+    timer_list_probe_("capture_png entry");
     /* v0.4.18.4: LED "say cheese" countdown, mirroring the snapshot path.
      * Three white blinks over ~600ms, LED off during capture, then green
      * on success / red on failure. Starts BEFORE the link check so the
@@ -2007,12 +2036,29 @@ esp_err_t eyes_capture_png(void)
         return ESP_ERR_INVALID_SIZE;
     }
 
+    timer_list_probe_("capture_png post-bulk");
     /* v0.4.18.79: Stream the PNG directly via png_chunk_cb_ instead of
      * buffering the entire image in a fixed 2MB PNG_OUT_CAP buffer.
      * The fixed buffer caused "sink full" ESP_FAIL on less-compressible
      * frames (e.g. 2,092,061 bytes > 2,097,152 cap). Streaming has no
      * size limit — mirrors the snaptest path (png_streaming_sink_cb). */
-    png_dbg_stream_ctx_t sctx = { .seq = 0, .failed = false, .total_bytes = 0 };
+    /* v0.4.49.1: the ctx MUST live in PSRAM, not on the stack — its
+     * b64_tmp is 11,270 B and this function runs on link_worker's 16 KB
+     * internal stack (the snaptest path learned this in v0.4.18.64 and
+     * heap-allocates its own ctx; the dbg path reintroduced the stack
+     * local in v0.4.18.79). On 0.4.49 every dbg png died with a
+     * StoreProhibited in esp_timer's timer_insert on a corrupted timer
+     * list — the signature of this stack blowing into internal heap. */
+    png_dbg_stream_ctx_t *sctx = (png_dbg_stream_ctx_t *)heap_caps_malloc(
+        sizeof(png_dbg_stream_ctx_t), MALLOC_CAP_SPIRAM);
+    if (!sctx) {
+        if (!raw_is_aob) heap_caps_free(raw);
+        led_camera_result(false);
+        return ESP_ERR_NO_MEM;
+    }
+    sctx->seq = 0;
+    sctx->failed = false;
+    sctx->total_bytes = 0;
     png_stream_cfg_t cfg = {
         .width = frame_w,
         .height = frame_h,
@@ -2024,12 +2070,15 @@ esp_err_t eyes_capture_png(void)
     png_stream_result_t res;
     ESP_LOGI(TAG, "PNG encode starting (streaming): %lux%lu", (unsigned long)frame_w, (unsigned long)frame_h);
     png_crash_detector_arm(2);
-    err = png_stream_encode(raw, &cfg, png_dbg_streaming_sink_cb, &sctx, &res);
+    err = png_stream_encode(raw, &cfg, png_dbg_streaming_sink_cb, sctx, &res);
     png_crash_detector_disarm();
+    timer_list_probe_("capture_png post-encode");
     ESP_LOGI(TAG, "PNG encode done: err=%d, bytes=%u, chunks=%d",
-             err, (unsigned)sctx.total_bytes, sctx.seq);
+             err, (unsigned)sctx->total_bytes, sctx->seq);
     if (!raw_is_aob) heap_caps_free(raw);
-    if (err != ESP_OK || sctx.failed) {
+    bool failed = sctx->failed;
+    heap_caps_free(sctx);
+    if (err != ESP_OK || failed) {
         led_camera_result(false);
         return err != ESP_OK ? err : ESP_FAIL;
     }
