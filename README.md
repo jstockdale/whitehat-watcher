@@ -1,5 +1,7 @@
 <p align="center"><img src="docs/assets/logo.png" alt="Watcher logo" width="120"></p>
 
+<p align="center"><img src="docs/assets/wordmark-t-small.png" alt="WATCHER wordmark — the T is Nobody, the lighthouse mascot, beams on" width="520"></p>
+
 # Watcher Input Assistant
 
 **Turning a Seeed Studio SenseCAP Watcher into an AI-driven input assistant.**
@@ -20,7 +22,23 @@ with a keyboard and mouse. Every hop in that loop is fast, byte-exact, and
 cryptographically sealed, and getting it that way is most of what's in this
 repository.
 
+The input assistant is the first use case, not the destination. The
+same loop — an eye that can watch, a sealed channel to an agent, and
+hands that can act — is what a bench co-working partner needs: the
+Watcher is being built to work a bench alongside Muse (and, in
+time, other agents), and its camera is a useful eye on physical
+processes, not just a detection layer. Point it at the coffee
+machine and it could start the timer when the pour starts; point it
+at a 3D printer and it could keep watch over the first layer; point
+it at a workbench and it could follow along while something is being
+made — then reach back through the same sealed channel to type a
+command, update an operator, or act. That wider field is why the
+pixels matter (see *Imaging* below): detail is what turns watching
+into understanding.
+
 <p align="center"><img src="docs/assets/hero.png" alt="Nobody the lighthouse and Muse, working side by side"></p>
+
+<p align="center"><em>Nobody the lighthouse and Muse at the bench — the co-working arrangement this project is building toward.</em></p>
 
 ## What it does
 
@@ -76,6 +94,29 @@ flowchart LR
   MQTT⇄serial relay. The **bridge** (`host-agent/mqtt-bridge/`) is a
   long-running subscriber plus the bench tooling (sealed command sender,
   firmware transfer, frame reassembler, bench lock, health checks).
+
+<p align="center"><img src="docs/assets/device-diagram.png" alt="Annotated diagram of the transparent-case SenseCAP Watcher" width="760"></p>
+
+<p align="center"><em>The hardware, annotated. Our unit is the transparent-case SenseCAP Watcher: every callout is a part the firmware actually drives, in the place it actually sits.</em></p>
+
+## The console: how the bench connects
+
+The console is a single web page the operator runs on the bench
+host. It talks to the Watcher over USB serial via WebSerial, and to
+the MQTT broker over TLS. In bridged mode it is the relay between
+the two: sealed commands from the host agent arrive via the bridge
+and the broker, cross the page, and go down the serial link to the
+device; frames and telemetry come back the same way. The page is a
+relay, never a trust anchor — the device verifies every seal
+itself, so the page cannot mint a command. Its Muse tab shows the
+full Muse→device command stream for the session, which is what
+makes bench work auditable at a glance. Firmware delivery runs
+through it too: chunks arrive over MQTT, the page verifies the
+hash, and a person clicks "flash".
+
+<p align="center"><img src="docs/assets/console.png" alt="The Watcher Console, Muse tab" width="760"></p>
+
+<p align="center"><em>The Watcher Console's Muse tab — link state on top, the session's Muse-driven command history below. This capture is the page at rest, before a device connects.</em></p>
 
 ## Trust model in one paragraph (the "seal")
 
@@ -271,6 +312,10 @@ model lives on the host — so the full frame is the point. For an
 agent reading a screen, those pixels are the difference between
 guessing at text and reading it.
 
+<p align="center"><img src="docs/assets/resolution.png" alt="The OV5647's frame sizes drawn to true relative scale" width="760"></p>
+
+<p align="center"><em>True relative scale: the OV5647's full 2592×1944 sensor frame, this project's 1296×972 full-frame capture, and the 640×480 ceiling of the stock inference pipeline — the sizes this section is about.</em></p>
+
 ## The S3 firmware
 
 ESP-IDF (v5.3), components under `firmware/components/` — `hid_ble`,
@@ -425,3 +470,9 @@ is correct behavior.) Full record:
 - Bench rule that explains half the commit history: *instrument first,
   guess never* — every performance claim in this README traces to a
   counter or a log line in `docs/`.
+
+---
+
+<p align="center"><img src="docs/assets/mascot.png" alt="Nobody, the lighthouse mascot" width="140"></p>
+
+<p align="center"><em>Nobody — the lighthouse on the badge, and the project's mascot. He does the watching.</em></p>

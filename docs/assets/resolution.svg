@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 1180" font-family="Verdana, Geneva, sans-serif">
+  <rect width="1800" height="1180" fill="#f6f1e7"/>
+  <text x="900" y="66" text-anchor="middle" font-size="40" font-weight="bold" fill="#17323c">How much of the sensor do you get?</text>
+  <text x="900" y="104" text-anchor="middle" font-size="20" fill="#4a6570">SenseCAP Watcher · OV5647 — rectangles drawn to true relative scale, sharing one corner</text>
+
+  <!-- plot origin (120, 1030); scale 0.44 px per sensor pixel -->
+  <!-- full sensor 2592x1944 -> 1140x855 -->
+  <rect x="120" y="175" width="1140" height="855" fill="#bcd8de" stroke="#0e4a5a" stroke-width="4"/>
+  <!-- our full-frame capture 1296x972 -> 570x428 -->
+  <rect x="120" y="602" width="570" height="428" fill="#f6c87e" stroke="#d98a1f" stroke-width="4"/>
+  <!-- largest stock inference preset 640x480 -> 282x211 -->
+  <rect x="120" y="819" width="282" height="211" fill="#a9d3a4" stroke="#3d8b40" stroke-width="4"/>
+
+  <text x="1240" y="205" text-anchor="end" font-size="24" font-weight="bold" fill="#0e4a5a">2592 × 1944</text>
+  <text x="670" y="640" font-size="24" font-weight="bold" fill="#7a4d08">1296 × 972</text>
+  <text x="262" y="855" text-anchor="middle" font-size="22" font-weight="bold" fill="#1e5626">640 × 480</text>
+
+  <!-- side legend -->
+  <g font-size="20" fill="#17323c">
+    <rect x="1330" y="240" width="34" height="34" fill="#bcd8de" stroke="#0e4a5a" stroke-width="3"/>
+    <text x="1380" y="252" font-weight="bold" font-size="23">Full sensor — 5.0 MP</text>
+    <text x="1380" y="282">2592×1944. Reached 1:1 with crop</text>
+    <text x="1380" y="308">windows anywhere in the frame.</text>
+    <text x="1380" y="342" font-weight="bold" fill="#0e4a5a">16× the pixels of the stock preset</text>
+
+    <rect x="1330" y="470" width="34" height="34" fill="#f6c87e" stroke="#d98a1f" stroke-width="3"/>
+    <text x="1380" y="482" font-weight="bold" font-size="23">Our full-frame capture — 1.26 MP</text>
+    <text x="1380" y="512">1296×972 RAW8, streamed losslessly</text>
+    <text x="1380" y="538">as PNG. Every pixel the on-device</text>
+    <text x="1380" y="564">frame buffer holds, in one shot.</text>
+    <text x="1380" y="598" font-weight="bold" fill="#7a4d08">4× the pixels of the stock preset</text>
+
+    <rect x="1330" y="720" width="34" height="34" fill="#a9d3a4" stroke="#3d8b40" stroke-width="3"/>
+    <text x="1380" y="732" font-weight="bold" font-size="23">Stock inference preset — 0.3 MP</text>
+    <text x="1380" y="762">640×480 is the largest frame the</text>
+    <text x="1380" y="788">camera pipeline normally serves —</text>
+    <text x="1380" y="814">sized for an on-chip AI model,</text>
+    <text x="1380" y="840">not for actually looking at things.</text>
+  </g>
+
+  <!-- leader lines from legend to rects -->
+  <g stroke="#4a6570" stroke-width="2" fill="none">
+    <path d="M1330 257 L1270 220"/>
+    <path d="M1330 487 L700 620"/>
+    <path d="M1330 737 L410 880"/>
+  </g>
+
+  <text x="120" y="1090" font-size="19" fill="#4a6570">Why it matters: text on a screen, a solder joint, a 3D print's first layer — the detail lives in the pixels the stock pipeline throws away.</text>
+  <text x="120" y="1122" font-size="19" fill="#4a6570">Crop windows (AT+CROP) read any 1,259,712-pixel window of the full sensor at native 1:1 resolution.</text>
+</svg>

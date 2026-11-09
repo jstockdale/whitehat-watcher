@@ -1,0 +1,198 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1680 1060" font-family="Verdana, Geneva, sans-serif">
+  <rect width="1680" height="1060" fill="#f6f1e7"/>
+  <text x="840" y="64" text-anchor="middle" font-size="40" font-weight="bold" fill="#17323c">SenseCAP Watcher — what does what</text>
+  <text x="840" y="102" text-anchor="middle" font-size="20" fill="#4a6570">One small sentinel: eyes, ears, a voice, and hands on your keyboard and mouse</text>
+
+  <!-- ===== device body: transparent-case SenseCAP Watcher, front view =====
+       Traced from a photo of the owner's actual clear-case unit (not the
+       symmetric squircle of the earlier draft). Real outline: flat-ish top,
+       squarer top-left corner, deep forehead, one big round bottom arc;
+       display sits low with a thin gap below. Camera in a raised boss at
+       top-left, LED dome right of it, mic capsule top-centre, knurled wheel
+       bursting out of the top-right corner, speaker behind the left rim,
+       microSD slot on the left rim, USB-C (power+data) on the bottom edge. -->
+  <defs>
+    <path id="shell" d="M 586,176
+      C 660,162 760,160 840,162
+      C 900,163 950,166 985,174
+      C 1015,181 1045,196 1066,222
+      C 1082,242 1098,268 1110,300
+      C 1126,342 1150,410 1158,460
+      C 1164,478 1166,488 1166,493
+      C 1162,548 1138,622 1092,692
+      C 1048,758 972,806 892,821
+      C 872,823 852,823 835,823
+      C 748,823 662,799 602,740
+      C 548,686 526,628 522,556
+      C 520,505 520,460 522,400
+      C 523,330 528,262 540,214
+      C 548,196 562,182 586,176 Z"/>
+    <clipPath id="shellClip"><use href="#shell"/></clipPath>
+  </defs>
+
+  <g>
+    <!-- wheel, top-right corner: drawn first so the shell seats in front of its lower-left quadrant -->
+    <g>
+      <circle cx="1034" cy="248" r="88" fill="#262b31" stroke="#10151a" stroke-width="4"/>
+      <g stroke="#454f58" stroke-width="6">
+        <line x1="1034" y1="162" x2="1034" y2="174"/>
+        <line x1="1034" y1="162" x2="1034" y2="174" transform="rotate(30 1034 248)"/>
+        <line x1="1034" y1="162" x2="1034" y2="174" transform="rotate(60 1034 248)"/>
+        <line x1="1034" y1="162" x2="1034" y2="174" transform="rotate(90 1034 248)"/>
+        <line x1="1034" y1="162" x2="1034" y2="174" transform="rotate(120 1034 248)"/>
+        <line x1="1034" y1="162" x2="1034" y2="174" transform="rotate(150 1034 248)"/>
+        <line x1="1034" y1="162" x2="1034" y2="174" transform="rotate(180 1034 248)"/>
+        <line x1="1034" y1="162" x2="1034" y2="174" transform="rotate(210 1034 248)"/>
+        <line x1="1034" y1="162" x2="1034" y2="174" transform="rotate(240 1034 248)"/>
+        <line x1="1034" y1="162" x2="1034" y2="174" transform="rotate(270 1034 248)"/>
+        <line x1="1034" y1="162" x2="1034" y2="174" transform="rotate(300 1034 248)"/>
+        <line x1="1034" y1="162" x2="1034" y2="174" transform="rotate(330 1034 248)"/>
+      </g>
+      <circle cx="1034" cy="248" r="44" fill="#30373f" stroke="#454f58" stroke-width="2"/>
+      <circle cx="1034" cy="248" r="20" fill="#22262b" stroke="#4a545e" stroke-width="2"/>
+    </g>
+    <!-- clear shell -->
+    <use href="#shell" fill="#e9eded"/>
+    <!-- internals seen through the case (kept subtle / diagram-clean) -->
+    <g clip-path="url(#shellClip)">
+      <rect x="588" y="258" width="486" height="486" rx="80" fill="#b7c9cd" opacity="0.30"/>
+      <rect x="695" y="738" width="310" height="36" rx="14" fill="#f3ecd9" opacity="0.38"/>
+      <!-- speaker module behind the left rim -->
+      <rect x="574" y="348" width="44" height="160" rx="10" fill="#3a444d" opacity="0.5"/>
+      <rect x="583" y="358" width="26" height="140" rx="8" fill="#2c343b" opacity="0.75"/>
+      <!-- amber flex / tape hints at the lower rim -->
+      <rect x="700" y="748" width="40" height="16" rx="3" fill="#e8a04c" opacity="0.55"/>
+      <rect x="950" y="748" width="40" height="16" rx="3" fill="#e8a04c" opacity="0.55"/>
+      <rect x="608" y="694" width="24" height="24" rx="3" fill="#d96f32" opacity="0.5"/>
+    </g>
+    <!-- wheel hub: clear boss over the wheel axis, drawn after the shell -->
+    <circle cx="1032" cy="245" r="62" fill="#d7e0e3" opacity="0.30" stroke="#93a5ab" stroke-width="2"/>
+    <circle cx="1032" cy="245" r="39" fill="none" stroke="#93a5ab" stroke-width="1.5" opacity="0.8"/>
+    <circle cx="1032" cy="245" r="22" fill="#22262b" opacity="0.85"/>
+    <!-- shell outline -->
+    <use href="#shell" fill="none" stroke="#8fa6ad" stroke-width="7"/>
+    <!-- camera, top-left, in a raised clear boss -->
+    <g>
+      <circle cx="625" cy="234" r="64" fill="none" stroke="#93a5ab" stroke-width="2" opacity="0.45"/>
+      <circle cx="625" cy="234" r="56" fill="#2a3138" stroke="#6b7680" stroke-width="5"/>
+      <circle cx="625" cy="234" r="42" fill="#141a1f"/>
+      <circle cx="625" cy="234" r="28" fill="#1d2f45"/>
+      <circle cx="625" cy="234" r="17" fill="#274b63"/>
+      <circle cx="612" cy="222" r="5" fill="#cfe8ef"/>
+    </g>
+    <!-- status LED dome, right of the camera -->
+    <circle cx="720" cy="219" r="31" fill="#f4f6f2" stroke="#93a5ab" stroke-width="2"/>
+    <circle cx="720" cy="219" r="9" fill="#4CAF50"/>
+    <!-- microphone capsule, top-centre (mesh grille + centre port) -->
+    <g>
+      <rect x="754" y="202" width="101" height="32" rx="16" fill="#39424a" stroke="#20262b" stroke-width="2"/>
+      <g fill="#9fb0b6">
+        <circle cx="766" cy="210" r="1.7"/><circle cx="778" cy="210" r="1.7"/><circle cx="790" cy="210" r="1.7"/><circle cx="802" cy="210" r="1.7"/><circle cx="814" cy="210" r="1.7"/><circle cx="826" cy="210" r="1.7"/><circle cx="838" cy="210" r="1.7"/>
+        <circle cx="766" cy="224" r="1.7"/><circle cx="778" cy="224" r="1.7"/><circle cx="790" cy="224" r="1.7"/><circle cx="802" cy="224" r="1.7"/><circle cx="814" cy="224" r="1.7"/><circle cx="826" cy="224" r="1.7"/><circle cx="838" cy="224" r="1.7"/>
+      </g>
+      <circle cx="804" cy="218" r="3.4" fill="#0b0f12"/>
+    </g>
+    <!-- round touchscreen -->
+    <g>
+      <circle cx="855" cy="519" r="235" fill="#232a30" stroke="#10161a" stroke-width="4"/>
+      <circle cx="855" cy="519" r="217" fill="#dceef2"/>
+      <circle cx="855" cy="519" r="217" fill="none" stroke="#ffffff" stroke-opacity="0.35" stroke-width="26" stroke-dasharray="120 1243" transform="rotate(-40 855 519)"/>
+      <!-- main-board chips behind the glass (projected positions) -->
+      <rect x="905" y="425" width="74" height="48" rx="4" fill="#a9c3cb" opacity="0.5" stroke="#54707b" stroke-width="1.5" stroke-dasharray="5 4"/>
+      <rect x="850" y="505" width="74" height="52" rx="4" fill="#a9c3cb" opacity="0.5" stroke="#54707b" stroke-width="1.5" stroke-dasharray="5 4"/>
+      <text x="790" y="590" text-anchor="middle" font-size="28" font-weight="bold" fill="#17323c">Hey Muse,</text>
+      <text x="790" y="628" text-anchor="middle" font-size="21" fill="#17323c">fancy a coffee run?</text>
+    </g>
+    <!-- case screws -->
+    <g fill="#d9c48f" stroke="#a68d4f" stroke-width="1.5" opacity="0.9">
+      <circle cx="651" cy="313" r="12"/><circle cx="884" cy="224" r="12"/><circle cx="1135" cy="396" r="12"/>
+      <circle cx="652" cy="714" r="12"/><circle cx="1002" cy="743" r="12"/>
+    </g>
+    <!-- microSD slot, left rim -->
+    <rect x="512" y="545" width="20" height="56" rx="5" fill="#39424a" stroke="#20262b" stroke-width="1.5"/>
+    <!-- USB-C (power + data) on the bottom edge, reset pinhole beside it -->
+    <rect x="805" y="812" width="76" height="22" rx="9" fill="#22262b"/>
+    <rect x="823" y="820" width="40" height="8" rx="4" fill="#7a8790"/>
+    <circle cx="775" cy="821" r="4" fill="#39424a"/>
+  </g>
+
+  <!-- ===== callouts: left (even 130px rhythm) ===== -->
+  <g font-size="19" fill="#17323c">
+    <g>
+      <polyline points="478,158 720,148 790,200" fill="none" stroke="#17323c" stroke-width="2"/>
+      <circle cx="790" cy="200" r="4.5" fill="#17323c"/>
+      <text x="462" y="157" text-anchor="end" font-weight="bold" font-size="22">Microphone — ES8311 codec</text>
+      <text x="462" y="185" text-anchor="end">Ears: “Hey Muse” wake word + voice takes</text>
+    </g>
+    <g>
+      <line x1="478" y1="285" x2="572" y2="234" stroke="#17323c" stroke-width="2"/>
+      <circle cx="572" cy="234" r="5" fill="#17323c"/>
+      <text x="462" y="287" text-anchor="end" font-weight="bold" font-size="22">Camera — OV5647</text>
+      <text x="462" y="315" text-anchor="end">2592×1944 stills · the eyes</text>
+    </g>
+    <g>
+      <polyline points="478,415 560,360 708,248" fill="none" stroke="#17323c" stroke-width="2"/>
+      <circle cx="708" cy="248" r="4.5" fill="#17323c"/>
+      <text x="462" y="417" text-anchor="end" font-weight="bold" font-size="22">Status LED — state at a glance</text>
+      <text x="462" y="445" text-anchor="end">Listening · thinking · recording</text>
+    </g>
+    <g>
+      <line x1="478" y1="540" x2="596" y2="420" stroke="#17323c" stroke-width="2"/>
+      <circle cx="596" cy="420" r="5" fill="#17323c"/>
+      <text x="462" y="537" text-anchor="end" font-weight="bold" font-size="22">Speaker</text>
+      <text x="462" y="565" text-anchor="end">Voice replies and tones</text>
+    </g>
+    <g>
+      <line x1="478" y1="662" x2="522" y2="573" stroke="#17323c" stroke-width="2"/>
+      <circle cx="522" cy="573" r="5" fill="#17323c"/>
+      <text x="462" y="657" text-anchor="end" font-weight="bold" font-size="22">microSD</text>
+      <text x="462" y="685" text-anchor="end">Append-only capture audit log</text>
+    </g>
+    <g>
+      <line x1="478" y1="788" x2="665" y2="655" stroke="#17323c" stroke-width="2"/>
+      <circle cx="665" cy="655" r="4.5" fill="#17323c"/>
+      <text x="462" y="782" text-anchor="end" font-weight="bold" font-size="22">1.45″ round touchscreen</text>
+      <text x="462" y="810" text-anchor="end">Display + touchpad · on-device replies</text>
+    </g>
+  </g>
+
+  <!-- ===== callouts: right ===== -->
+  <g font-size="19" fill="#17323c">
+    <g>
+      <line x1="1210" y1="205" x2="1108" y2="292" stroke="#17323c" stroke-width="2"/>
+      <circle cx="1108" cy="292" r="5" fill="#17323c"/>
+      <text x="1218" y="192" font-weight="bold" font-size="22">Rotary wheel + push button</text>
+      <text x="1218" y="220">Scroll, press-and-talk, wake</text>
+    </g>
+    <g>
+      <line x1="1210" y1="410" x2="952" y2="450" stroke="#17323c" stroke-width="2"/>
+      <circle cx="952" cy="450" r="4.5" fill="#17323c"/>
+      <text x="1218" y="392" font-weight="bold" font-size="22">ESP32-S3</text>
+      <text x="1218" y="420">The brain: firmware, BLE HID,</text>
+      <text x="1218" y="446">sealed commands, Wi-Fi</text>
+    </g>
+    <g>
+      <line x1="1210" y1="570" x2="905" y2="538" stroke="#17323c" stroke-width="2"/>
+      <circle cx="905" cy="538" r="4.5" fill="#17323c"/>
+      <text x="1218" y="552" font-weight="bold" font-size="22">Himax HX6538</text>
+      <text x="1218" y="580">Camera co-processor — runs the</text>
+      <text x="1218" y="606">SSCMA / SPI imaging pipeline</text>
+    </g>
+    <g>
+      <rect x="1210" y="720" width="420" height="150" rx="14" fill="#e9f4e4" stroke="#4CAF50" stroke-width="3"/>
+      <text x="1232" y="758" font-weight="bold" font-size="21" fill="#1e5626">How it works together</text>
+      <text x="1232" y="788">The Himax serves frames over SPI;</text>
+      <text x="1232" y="814">the S3 streams them to the console,</text>
+      <text x="1232" y="840">and Muse sees, decides, and types</text>
+      <text x="1232" y="866">back over BLE HID. All sealed.</text>
+    </g>
+  </g>
+
+  <!-- ===== callout: bottom centre ===== -->
+  <g font-size="19" fill="#17323c">
+    <line x1="843" y1="838" x2="843" y2="938" stroke="#17323c" stroke-width="2"/>
+    <circle cx="843" cy="838" r="5" fill="#17323c"/>
+    <text x="843" y="952" text-anchor="middle" font-weight="bold" font-size="22">USB-C — CH342</text>
+    <text x="843" y="980" text-anchor="middle">Console serial link + power</text>
+  </g>
+</svg>
