@@ -187,6 +187,43 @@ single failure was a response-side CRC flake with 73 historical
 occurrences across firmware eras), frames arrived **byte-exact**, and
 bulk stayed at ~4 s with zero CRC failures.
 
+### Customizing the Himax firmware
+
+The Himax side started as Seeed's SSCMA example app
+(`EPII_CM55M_APP_S/`) and has been reworked into a **capture-only
+camera server**: the stock on-chip inference pipeline is out, and
+what remains is the AT command server, sensor control, and our SPI
+transport. Everything project-specific lives in that fork:
+
+- the `FEATURE_TRANSPORT` SPI slave described above;
+- a sensor preset table whose top entry (preset 8) is a full-frame
+  1296×972 RAW8 capture mode — see *Imaging* below;
+- `AT+SPIDUMP`, the capture-and-stage command behind the SPI bulk
+  frame pull;
+- the signal-driven RX re-arm gate and the parser scan-realignment;
+- build fingerprinting: `WATCHER_BUILD_HASH`, generated from the key
+  sources by `gen_build_hash.sh` and printed at boot, so the running
+  artifact can be identified unambiguously.
+
+Customizing it further follows the shape those changes established:
+
+- **New AT commands** are registered with `addService()` in
+  sscma_micro's AT server (`library/sscma_micro/sscma/server/at/ma_server_at.cpp`;
+  larger handlers live under `callback/`). `AT+SPIDUMP` is the
+  worked example: it captures a frame and stages it, with length
+  and SHA-256, for the SPI bulk read. Because there is a single AT
+  server, a command registered once is served identically over
+  UART and SPI; only the transport differs.
+- **Sensor behavior** is data, not code paths: modes live in the
+  firmware's preset table, the S3 discovers them at link-up with
+  `AT+SENSORS?` and selects by *resolution*, and `AT+SENSOR?`
+  reports the live mode. Host code never hardcodes preset IDs, so a
+  Himax-side table change doesn't silently break the S3.
+- **Versioning is two lines, deliberately.** Himax builds carry
+  their own version (current: 0.4.20.60) independent of the S3's
+  0.4.x line, and the boot print pairs it with the build
+  fingerprint. Trust the fingerprint, not the filename.
+
 ### Building and flashing the Himax firmware
 
 - Toolchain: ARM GNU 13.2; the app lives in
@@ -204,6 +241,32 @@ bulk stayed at ~4 s with zero CRC failures.
   holds the S3 in reset during the transfer so the SPI link stays out
   of the way). The person, not the agent, runs the flash.
 
+## Imaging: the full frame
+
+The camera is an OmniVision OV5647 — 5 MP, 2592×1944 native,
+120° FOV, fixed focus at 3 m — wired to the Himax. The S3 never
+touches it directly; it receives frames only over the SPI bulk
+pull described above.
+
+Sensor modes are discovered, never assumed. At link-up the S3
+asks the Himax for its mode table (`AT+SENSORS?`) and selects
+modes by *resolution*; `AT+SENSOR?` reports the live mode. Most
+of the table is inference-era sizes — presets from 240×240 up to
+640×480, meant for models running on the Himax itself. The entry
+this project runs on is the top one:
+
+**Preset 8: 1296×972 RAW8 — the full frame.** Every capture the
+input assistant makes is the complete 1296×972 frame
+(1,259,712 bytes of RAW8), pulled over SPI in ~4 s, debayered and
+PNG-encoded on the S3 — whose frame buffer is sized exactly to
+it. As far as we know, that makes this the only project pulling
+full frames off this device: stock firmware and the wider SSCMA
+ecosystem work at inference resolutions, because they are built
+to run models on-chip. This firmware is capture-first — the
+model lives on the host — so the full frame is the point. For an
+agent reading a screen, those pixels are the difference between
+guessing at text and reading it.
+
 ## The S3 firmware
 
 ESP-IDF (v5.3), components under `firmware/components/` — `hid_ble`,
@@ -213,10 +276,10 @@ chain, and mode/touch/wheel/wake-word input components. Highlights:
 
 - **Sealed-only control, reads included.** Discrete queries verify
   exactly like commands; scopes are enforced at verify time.
-- **The PNG pipeline**: 1296×972 frames are debayered, filtered, and
-  deflate-encoded on-device (pure encode CPU measures ≈ 9 s — the wire,
-  not the CPU, was always the wall), then streamed as chunked,
-  length-tagged JSON.
+- **The PNG pipeline**: 1296×972 full frames (see *Imaging*) are
+  debayered, filtered, and deflate-encoded on-device (pure encode CPU
+  measures ≈ 9 s — the wire, not the CPU, was always the wall), then
+  streamed as chunked, length-tagged JSON.
 - **Chunk-loss RCA, closed.** All device output shares one 32 KB PSRAM
   ring with a chasing reader, and two distinct loss mechanisms were
   found and fixed: a *lap deletion* (a chunk could leave the ring
@@ -310,20 +373,31 @@ daily driver for all of it. Still on the list: the formal 20-frame
 soak for the SPI work (validation so far: 160 link tests, 923+ bulk
 commands, multiple full frames).
 
-**Known issue:** an interrupt-watchdog panic in the legacy I2C ISR
-path has been seen twice (2026-11-07, 2026-11-08), each time with
-clean recovery; root cause not yet established. Investigation prep:
-`docs/i2c-isr-wdt-investigation-prep-2026-11-08.md`. (The watchdogs
-stay enabled — a watchdog firing on a hang is correct behavior.)
+**Known issue (root-caused, fix in 0.4.49):** an interrupt-watchdog
+panic in the legacy I2C path recurred across 0.4.40–0.4.48 (five
+sightings, always during quiet wake-word listening, always with
+clean recovery). Symbolizing the panic backtrace against the build
+established the chain: the vendor IO-expander driver's read cache
+never engages on a part configured without an interrupt pin, so the
+10 ms wheel-button poll was issuing a real I2C transaction
+~100 times a second; a rare bus timeout then dropped the legacy
+driver into its FSM-reset path, which occasionally spun in ISR
+context past the interrupt watchdog. The fix samples the button at
+50 ms with a failure backoff and runs I2C0 at 100 kHz instead of
+400 kHz. (The watchdogs stay enabled — a watchdog firing on a hang
+is correct behavior.) Full record:
+`docs/i2c-isr-wdt-investigation-prep-2026-11-08.md`.
 
 **Next, in order:**
 
-1. **Streaming audio shipping**: today a take is captured in full,
-   then sent — with no flow control, so chunks can be lost in
-   transit. The rework puts a PSRAM ring buffer between capture and
-   a dedicated sender task so sends overlap capture instead of
-   following it. (Extending the image path's ack gate to audio is
-   the follow-on candidate.)
+1. **Streaming audio shipping** (built in 0.4.49, in verification):
+   a take used to be captured in full, then sent — with no flow
+   control, so chunks could be lost in transit. 0.4.49 puts a PSRAM
+   ring buffer between capture and a dedicated sender task so sends
+   overlap capture; streamed chunks carry their chunk total only on
+   the final chunk, and the bridge and console reassemblers were
+   updated to match. (Extending the image path's ack gate to audio
+   is the follow-on candidate.)
 2. **Native Wi-Fi MQTT (Track B)**: the device on the broker
    directly, alongside — not instead of — the tethered mode. First
    the mirror-queue fix (bounded-blocking enqueue + drop counter)

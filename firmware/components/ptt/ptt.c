@@ -31,6 +31,8 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "driver/i2s_std.h"
 #include "driver/i2c.h"
 
@@ -192,10 +194,113 @@ static uint8_t codec_addr7_ = 0;
 static const audio_codec_data_if_t *data_if_ = NULL;
 static esp_codec_dev_handle_t codec_dev_ = NULL;
 
-static uint8_t *adpcm_buf_ = NULL;   /* PSRAM, PTT_MAX_MS worth */
-static size_t adpcm_len_ = 0;
 static adpcm_state_t adpcm_st_;
 static int64_t rec_start_us_ = 0;
+
+/* ---- v0.4.49: streaming shipper (ring buffer + sender task) ----
+ * Design: docs/audio-streaming-design-2026-11-09.md.
+ *
+ * rec_feed (producer, ptt_task) encodes ADPCM into a PSRAM byte
+ * ring; a persistent sender task (created once in ptt_init — never
+ * per take; the 0.4.45 re-arm bug is the standing lesson on
+ * hand-rolled task lifecycles) slices the stream into the same
+ * 1536-byte chunks the store-then-send path used and ships them
+ * DURING the take at real-time cadence. Ring capacity = the full
+ * max take, so the wedged-link worst case is byte-identical to the
+ * old full-buffer behavior.
+ *
+ * SPSC discipline: ring_prod_ is written only by the producer,
+ * ring_cons_ only by the sender; each reads the other's counter
+ * (volatile, word-atomic on the S3). Overflow policy: if the ring
+ * fills, the producer stops appending for the REST of the take and
+ * counts the remainder as unsent — the shipped stream is always a
+ * clean decodable prefix, never a stream with a silent hole
+ * (a hole would corrupt IMA-ADPCM decoding downstream of it).
+ * audio_end reports the truncation via its dropped count.
+ *
+ * Wire contract: streamed chunks OMIT "total" (unknowable until
+ * the take ends); the final chunk carries the true total, which is
+ * the consumers' completion signal alongside audio_end. Bridge and
+ * console were updated in the same release to match. */
+#define SHIP_RING_CAP   ((PTT_MAX_MS * PTT_SAMPLE_RATE / 1000) / 2)
+#define SHIP_MIN_BYTES  ((PTT_MIN_MS * PTT_SAMPLE_RATE / 1000) / 2)
+
+static uint8_t *ship_ring_ = NULL;              /* PSRAM, SHIP_RING_CAP */
+static volatile size_t ring_prod_ = 0;          /* bytes ever appended */
+static volatile size_t ring_cons_ = 0;          /* bytes ever consumed */
+static size_t take_prod_start_ = 0;             /* ring_prod_ at BEGIN */
+static size_t take_produced_ = 0;               /* appended this take */
+static size_t take_unsent_ = 0;                 /* truncated this take */
+static bool take_overflowed_ = false;
+
+typedef enum { SHIP_BEGIN, SHIP_END } ship_msg_kind_t;
+typedef struct {
+    ship_msg_kind_t kind;
+    int64_t id;            /* take id (rec_start ms) */
+    /* END-only snapshot (ptt_task globals are reset by the next
+     * rec_start, which is gated on take_done_, so the sender may
+     * also read them — the snapshot keeps the hand-off explicit). */
+    bool ship;             /* false = discard (tap / empty) */
+    int dur_ms;
+    size_t produced;       /* bytes appended to the ring */
+    size_t unsent;         /* bytes truncated by a full ring */
+    int peak;
+    const char *stop;      /* string literal, as today */
+    bool vad_ext;
+    float thr, amb, spk;
+} ship_msg_t;
+
+static QueueHandle_t ship_q_ = NULL;
+static SemaphoreHandle_t take_done_ = NULL;     /* given = no take in flight */
+static task_psram_handle_t *ship_task_psram_ = NULL;
+static TaskHandle_t ship_task_ = NULL;
+
+/* Producer append (ptt_task only). Truncate-on-overflow: once the
+ * ring is full, the rest of the take is counted unsent and never
+ * written — the shipped stream stays a clean prefix. */
+static void ring_append(const uint8_t *data, size_t len)
+{
+    if (take_overflowed_) {
+        take_unsent_ += len;
+        return;
+    }
+    if (len > SHIP_RING_CAP - (ring_prod_ - ring_cons_)) {
+        take_overflowed_ = true;
+        take_unsent_ += len;
+        ESP_LOGW(TAG, "ship ring full — take truncated at %u bytes",
+                 (unsigned)take_produced_);
+        return;
+    }
+    size_t pos = ring_prod_ % SHIP_RING_CAP;
+    size_t first = SHIP_RING_CAP - pos;
+    if (first > len) {
+        first = len;
+    }
+    memcpy(ship_ring_ + pos, data, first);
+    if (len > first) {
+        memcpy(ship_ring_, data + first, len - first);
+    }
+    ring_prod_ += len;
+    take_produced_ += len;
+    if (ship_task_) {
+        xTaskNotifyGive(ship_task_);
+    }
+}
+
+/* Sender-side copy-out of the next len unconsumed bytes (the sender
+ * advances ring_cons_ itself once it has dealt with the chunk). */
+static void ring_copy_out(uint8_t *dst, size_t len)
+{
+    size_t pos = ring_cons_ % SHIP_RING_CAP;
+    size_t first = SHIP_RING_CAP - pos;
+    if (first > len) {
+        first = len;
+    }
+    memcpy(dst, ship_ring_ + pos, first);
+    if (len > first) {
+        memcpy(dst + first, ship_ring_, len - first);
+    }
+}
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
@@ -945,15 +1050,24 @@ static void rec_start(bool ext)
         wakeword_start(); /* give the mic back */
         return;
     }
-    size_t max_adpcm = (PTT_MAX_MS * PTT_SAMPLE_RATE / 1000) / 2;
-    adpcm_buf_ = heap_caps_malloc(max_adpcm, MALLOC_CAP_SPIRAM);
-    if (!adpcm_buf_) {
-        ESP_LOGE(TAG, "no PSRAM for audio buffer");
+    /* v0.4.49: one take in flight, ever. The previous take's sender
+     * must have finished (audio_end sent, take_done_ given) before a
+     * new take touches the ring or the take-scoped globals. In the
+     * streaming steady state the drain is at most one chunk behind,
+     * so this is already given; the bounded wait binds only when the
+     * link is wedged — exactly when starting another take would be
+     * wrong. Timing out fails the start loudly rather than
+     * interleaving two takes into one stream. */
+    if (xSemaphoreTake(take_done_, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        ESP_LOGE(TAG, "previous take still shipping — cannot record");
         i2s_release();
         wakeword_start();
         return;
     }
-    adpcm_len_ = 0;
+    take_prod_start_ = ring_prod_;
+    take_produced_ = 0;
+    take_unsent_ = 0;
+    take_overflowed_ = false;
     adpcm_st_.predictor = 0;
     adpcm_st_.step_index = 0;
     ptt_mic_peak_reset();
@@ -998,6 +1112,11 @@ static void rec_start(bool ext)
                  amb, spk, thr, VAD_SILENCE_MS);
     }
     rec_start_us_ = esp_timer_get_time();
+    /* v0.4.49: hand the take to the sender BEFORE the first
+     * rec_feed appends (ptt_task calls rec_feed only after
+     * rec_start returns, so this ordering is structural). */
+    ship_msg_t begin = { .kind = SHIP_BEGIN, .id = rec_start_us_ / 1000 };
+    xQueueSend(ship_q_, &begin, portMAX_DELAY);
     recording_ = true;
     led_set_state(LED_STATE_RECORDING);
     ESP_LOGI(TAG, "recording...");
@@ -1018,12 +1137,16 @@ static void rec_feed(void)
         return;
     }
     size_t samples = PTT_PCM_CHUNK;
-    size_t max_adpcm = (PTT_MAX_MS * PTT_SAMPLE_RATE / 1000) / 2;
-    for (size_t i = 0; i + 1 < samples && adpcm_len_ + 1 < max_adpcm; i += 2) {
+    /* v0.4.49: encode into a staging chunk and append to the ship
+     * ring; the sender task streams it out during the take. */
+    uint8_t stage[PTT_PCM_CHUNK / 2];
+    size_t n_stage = 0;
+    for (size_t i = 0; i + 1 < samples; i += 2) {
         uint8_t lo = adpcm_nibble(&adpcm_st_, pcm[i]);
         uint8_t hi = adpcm_nibble(&adpcm_st_, pcm[i + 1]);
-        adpcm_buf_[adpcm_len_++] = (uint8_t)((hi << 4) | lo);
+        stage[n_stage++] = (uint8_t)((hi << 4) | lo);
     }
+    ring_append(stage, n_stage);
 
     /* v0.4.44: dynamic silence detection (external takes only).
      * Per 64 ms chunk RMS: arm once speech-level energy appears
@@ -1073,134 +1196,230 @@ static void rec_feed(void)
     }
 }
 
-static void rec_stop_and_send(void)
+/* v0.4.49: take end is a hand-off, not a shipment. ptt_task
+ * snapshots the take's final stats and queues END; the sender task
+ * (below) owns everything from here: draining the ring, audio_end,
+ * and the completion sequence. Discard semantics are decided here,
+ * exactly as the old synchronous path did (dur < PTT_MIN_MS or no
+ * audio produced), and the sender honors them without emitting a
+ * single byte for a discarded take. */
+static void rec_stop(void)
 {
     recording_ = false;
     led_clear_state(LED_STATE_RECORDING);
     led_clear_state(LED_STATE_REC_ENDING);
 
     int dur_ms = (int)((esp_timer_get_time() - rec_start_us_) / 1000);
-    size_t len = adpcm_len_;
-    uint8_t *buf = adpcm_buf_;
-    adpcm_buf_ = NULL;
-    adpcm_len_ = 0;
-
-    if (dur_ms < PTT_MIN_MS || len == 0) {
+    ship_msg_t end = {
+        .kind = SHIP_END,
+        .id = rec_start_us_ / 1000,
+        .ship = !(dur_ms < PTT_MIN_MS || take_produced_ == 0),
+        .dur_ms = dur_ms,
+        .produced = take_produced_,
+        .unsent = take_unsent_,
+        .peak = (int)mic_peak_win_,
+        .stop = stop_reason_,
+        .vad_ext = vad_ext_,
+        .thr = vad_thr_, .amb = vad_amb_, .spk = vad_spk_,
+    };
+    if (!end.ship) {
         ESP_LOGI(TAG, "discarded %dms tap", dur_ms);
-        heap_caps_free(buf);
-        /* Still release I2S and resume wake-word on the discard path. */
-        i2s_release();
-        wakeword_start();
-        return;
     }
+    xQueueSend(ship_q_, &end, portMAX_DELAY);
+}
 
-    /* Encoding + shipping the audio is device work: breathe green until
-     * done, then a single green pulse as confirmation. */
-    led_set_state(LED_STATE_WORKING);
-
-    /* Ship as base64 chunks. PTT_ADPCM_CHUNK is a multiple of 3. */
-    size_t total = (len + PTT_ADPCM_CHUNK - 1) / PTT_ADPCM_CHUNK;
-    /* v0.4.6: PSRAM for base64 buffer (~5.5KB, was internal). PTT runs on PSRAM stack. */
-    char *b64 = heap_caps_malloc(PTT_ADPCM_CHUNK * 4 / 3 + 1, MALLOC_CAP_SPIRAM);
-    if (!b64) {
-        ESP_LOGE(TAG, "no mem for b64");
-        heap_caps_free(buf);
-        led_clear_state(LED_STATE_WORKING);
-        i2s_release();
-        wakeword_start();
-        return;
+/* Send one audio chunk with the discipline the image paths got in
+ * 0.4.18.81 and the old audio loop in 0.4.36: wait for ring room,
+ * retry a failed send (link_send owns the object either way, so it
+ * is rebuilt per attempt), report success/failure to the caller's
+ * drop counter. The base64 padding dance is byte-identical to the
+ * old store-then-send loop, so the same audio produces the same
+ * wire payloads. final chunks additionally carry the true total. */
+static bool ship_send_chunk(const uint8_t *bytes, size_t n, int64_t id,
+                            size_t seq, int ms, bool final, size_t total,
+                            char *b64)
+{
+    /* pad to multiple of 3 for the encoder */
+    size_t npad = (3 - (n % 3)) % 3;
+    uint8_t tail[3] = {0, 0, 0};
+    size_t nfull = n - (n % 3);
+    b64_encode(bytes, nfull, b64);
+    if (n % 3) {
+        memcpy(tail, bytes + nfull, n % 3);
+        char tmp[8];
+        b64_encode(tail, 3, tmp);
+        size_t bl = strlen(b64);
+        memcpy(b64 + bl, tmp, 4 - npad);
+        for (size_t p = 0; p < npad; p++) b64[bl + 4 - npad + p] = '=';
+        b64[bl + 4] = '\0';
     }
-    int64_t id = rec_start_us_ / 1000;
-    int dropped = 0;
-    for (size_t s = 0; s < total; s++) {
-        size_t off = s * PTT_ADPCM_CHUNK;
-        size_t n = len - off > PTT_ADPCM_CHUNK ? PTT_ADPCM_CHUNK : len - off;
-        /* pad to multiple of 3 for the encoder */
-        size_t npad = (3 - (n % 3)) % 3;
-        uint8_t tail[3] = {0, 0, 0};
-        size_t nfull = n - (n % 3);
-        b64_encode(buf + off, nfull, b64);
-        if (n % 3) {
-            memcpy(tail, buf + off + nfull, n % 3);
-            char tmp[8];
-            b64_encode(tail, 3, tmp);
-            size_t bl = strlen(b64);
-            memcpy(b64 + bl, tmp, 4 - npad);
-            for (size_t p = 0; p < npad; p++) b64[bl + 4 - npad + p] = '=';
-            b64[bl + 4] = '\0';
+    size_t need = strlen(b64) + 128;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (!link_wait_for_ring_space(2000, need)) {
+            ESP_LOGW(TAG, "audio seq %u: ring still full", (unsigned)seq);
+            continue;
         }
-        /* v0.4.36: pace + verify, the discipline the image paths got in
-         * 0.4.18.81. The old loop fired link_send unchecked: with the
-         * ring busy, whole chunks dropped silently (42% of a take lost
-         * at 115200, ~38% even at 750000). Wait for room, retry a
-         * failed send (link_send owns the object either way, so it is
-         * rebuilt per attempt), and count whatever still gets away. */
-        size_t need = strlen(b64) + 128;
-        bool sent = false;
-        for (int attempt = 0; attempt < 3 && !sent; attempt++) {
-            if (!link_wait_for_ring_space(2000, need)) {
-                ESP_LOGW(TAG, "audio seq %u: ring still full", (unsigned)s);
+        cJSON *obj = link_new_event("audio");
+        if (!obj) {
+            break;
+        }
+        cJSON_AddNumberToObject(obj, "id", (double)id);
+        cJSON_AddNumberToObject(obj, "seq", (double)seq);
+        if (final) {
+            cJSON_AddNumberToObject(obj, "total", (double)total);
+        }
+        cJSON_AddNumberToObject(obj, "ms", (double)ms);
+        cJSON_AddStringToObject(obj, "data", b64);
+        if (link_send(obj) == ESP_OK) { /* takes ownership */
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ---- sender task: one instance, created in ptt_init, lives forever ----
+ *
+ * Per take: consume BEGIN, stream full chunks as they accumulate
+ * (after the commit point), consume END, drain to the take's final
+ * byte, emit the final chunk (with total) + audio_end, then run the
+ * old completion sequence in the old order and give take_done_.
+ * A discarded take is drained silently: no chunks, no audio_end,
+ * no LEDs — the old discard path's observable behavior. */
+static void ship_task(void *arg)
+{
+    (void)arg;
+    uint8_t *chunk = heap_caps_malloc(PTT_ADPCM_CHUNK, MALLOC_CAP_SPIRAM);
+    char *b64 = heap_caps_malloc(PTT_ADPCM_CHUNK * 4 / 3 + 1,
+                                 MALLOC_CAP_SPIRAM);
+    if (!chunk || !b64) {
+        ESP_LOGE(TAG, "ship task: no PSRAM for chunk buffers");
+        vTaskDelete(NULL);
+        return;
+    }
+    for (;;) {
+        ship_msg_t begin;
+        if (xQueueReceive(ship_q_, &begin, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (begin.kind != SHIP_BEGIN) {
+            ESP_LOGW(TAG, "ship: END without BEGIN, ignored");
+            continue;
+        }
+        bool ending = false;
+        ship_msg_t end = { .kind = SHIP_END, .id = begin.id };
+        size_t end_target = 0;   /* ring_prod_ value that ends the take */
+        size_t seq = 0;
+        int dropped = 0;
+        bool committed = false;
+        bool working = false;
+        while (!ending || ring_cons_ < end_target) {
+            if (!ending) {
+                ship_msg_t m2;
+                if (xQueueReceive(ship_q_, &m2, 0) == pdTRUE &&
+                    m2.kind == SHIP_END) {
+                    ending = true;
+                    end = m2;
+                    end_target = take_prod_start_ + m2.produced;
+                    if (m2.id != begin.id) {
+                        ESP_LOGW(TAG, "ship: END id mismatch "
+                                      "(begin %lld, end %lld)",
+                                 (long long)begin.id, (long long)m2.id);
+                    }
+                }
+            }
+            size_t avail = ring_prod_ - ring_cons_;
+            if (!committed) {
+                if (avail >= SHIP_MIN_BYTES || (ending && end.ship)) {
+                    committed = true;
+                } else if (ending) {
+                    break;   /* discarded take: drain silently below */
+                }
+            }
+            if (committed && avail > 0) {
+                size_t remain = ending ? (end_target - ring_cons_) : avail;
+                size_t n = remain > PTT_ADPCM_CHUNK ? PTT_ADPCM_CHUNK
+                                                    : remain;
+                bool final = ending && (ring_cons_ + n >= end_target);
+                if (!final && n < PTT_ADPCM_CHUNK) {
+                    /* Partial chunk, take still running: wait for the
+                     * rest of it (producer notifies per append). */
+                    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+                    continue;
+                }
+                if (!working) {
+                    /* Shipping is device work: breathe green until
+                     * done (the old path's signal, at first emit). */
+                    led_set_state(LED_STATE_WORKING);
+                    working = true;
+                }
+                ring_copy_out(chunk, n);
+                size_t total_chunks =
+                    (end.produced + PTT_ADPCM_CHUNK - 1) / PTT_ADPCM_CHUNK;
+                int ms = final ? end.dur_ms
+                               : (int)(esp_timer_get_time() / 1000 -
+                                       begin.id);
+                if (!ship_send_chunk(chunk, n, begin.id, seq, ms, final,
+                                     total_chunks, b64)) {
+                    dropped++;
+                    ESP_LOGE(TAG, "audio seq %u dropped after retries",
+                             (unsigned)seq);
+                }
+                ring_cons_ += n;
+                seq++;
                 continue;
             }
-            cJSON *obj = link_new_event("audio");
-            if (!obj) { break; }
-            cJSON_AddNumberToObject(obj, "id", (double)id);
-            cJSON_AddNumberToObject(obj, "seq", (double)s);
-            cJSON_AddNumberToObject(obj, "total", (double)total);
-            cJSON_AddNumberToObject(obj, "ms", (double)dur_ms);
-            cJSON_AddStringToObject(obj, "data", b64);
-            sent = (link_send(obj) == ESP_OK); /* takes ownership */
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
         }
-        if (!sent) {
-            dropped++;
-            ESP_LOGE(TAG, "audio seq %u dropped after retries", (unsigned)s);
-        }
-    }
-    free(b64);
 
-    cJSON *end = link_new_event("audio_end");
-    if (end) {
-        cJSON_AddNumberToObject(end, "id", (double)id);
-        cJSON_AddNumberToObject(end, "chunks", (double)total);
-        cJSON_AddNumberToObject(end, "ms", (double)dur_ms);
-        cJSON_AddNumberToObject(end, "peak", (double)mic_peak_win_);
-        /* v0.4.44: how the take ended, and — for wake-word takes —
-         * the dynamic threshold inputs (ambient floor / speech
-         * reference) and the derived threshold, so the silence stop
-         * is verifiable from the bridge, not just on-device. */
-        cJSON_AddStringToObject(end, "stop", stop_reason_);
-        if (vad_ext_) {
-            cJSON_AddNumberToObject(end, "thr", (double)vad_thr_);
-            cJSON_AddNumberToObject(end, "amb", (double)vad_amb_);
-            cJSON_AddNumberToObject(end, "spk", (double)vad_spk_);
+        if (ending && end.ship) {
+            size_t total_chunks =
+                (end.produced + PTT_ADPCM_CHUNK - 1) / PTT_ADPCM_CHUNK;
+            int total_dropped = dropped +
+                (int)((end.unsent + PTT_ADPCM_CHUNK - 1) / PTT_ADPCM_CHUNK);
+            cJSON *e = link_new_event("audio_end");
+            if (e) {
+                cJSON_AddNumberToObject(e, "id", (double)end.id);
+                cJSON_AddNumberToObject(e, "chunks", (double)total_chunks);
+                cJSON_AddNumberToObject(e, "ms", (double)end.dur_ms);
+                cJSON_AddNumberToObject(e, "peak", (double)end.peak);
+                /* v0.4.44 fields, carried through the END snapshot. */
+                cJSON_AddStringToObject(e, "stop", end.stop);
+                if (end.vad_ext) {
+                    cJSON_AddNumberToObject(e, "thr", (double)end.thr);
+                    cJSON_AddNumberToObject(e, "amb", (double)end.amb);
+                    cJSON_AddNumberToObject(e, "spk", (double)end.spk);
+                }
+                if (total_dropped) {
+                    cJSON_AddNumberToObject(e, "dropped",
+                                            (double)total_dropped);
+                }
+                link_send(e);
+            }
+            ESP_LOGI(TAG, "sent %dms audio in %d chunks "
+                          "(%d dropped, stop=%s)",
+                     end.dur_ms, (int)total_chunks, total_dropped,
+                     end.stop);
+            if (working) {
+                led_clear_state(LED_STATE_WORKING);
+            }
+            led_flash_success();
+            /* The host is about to transcribe/process this audio:
+             * purple "AI thinking" until it responds (or 60 s). */
+            link_ai_thinking_start();
+        } else {
+            /* Discard: consume the take's ring bytes so the next take
+             * starts from a clean stream position. */
+            ring_cons_ = ring_prod_;
         }
-        if (dropped) {
-            cJSON_AddNumberToObject(end, "dropped", (double)dropped);
-        }
-        link_send(end);
+        /* Give I2S0 back: release our channel, then let the wake-word
+         * component resume listening (no-op if never enabled). This
+         * is also where the old path's take-end mic probe used to
+         * run — removed in 0.4.43.1, see git history; do not
+         * reintroduce per-take codec cycling here. */
+        i2s_release();
+        wakeword_start();
+        xSemaphoreGive(take_done_);
     }
-    heap_caps_free(buf);
-    ESP_LOGI(TAG, "sent %dms audio in %d chunks (%d dropped, stop=%s)",
-             dur_ms, (int)total, dropped, stop_reason_);
-    led_clear_state(LED_STATE_WORKING);
-    led_flash_success();
-    /* The host is about to transcribe/process this audio: show purple
-     * "AI thinking" until it responds (or 60s timeout). The success pulse
-     * above is a transient, so it plays first, then purple breathes. */
-    link_ai_thinking_start();
-    /* v0.4.43.1: the v0.4.38 take-end mic probe is GONE. Its rapid
-     * close/open cycles on the record codec crash in esp_codec_dev's
-     * paired-channel handling now that the ES8311 DAC is permanently
-     * open (0.4.43): a close pends the RX disable (paired TX still
-     * running), and a later reopen enables an RX channel whose DMA
-     * state is gone — LoadProhibited in i2s_rx_channel_start,
-     * 2026-11-08, first live PTT take on 0.4.43. The probe's hunt
-     * (the silent-mic RCA) is finished anyway. ptt_mic_probe() stays
-     * in the binary, uncalled, for manual resurrection if needed. */
-    /* Give I2S0 back: release our channel, then let the wake-word
-     * component resume listening (no-op if it was never enabled). */
-    i2s_release();
-    wakeword_start();
 }
 
 /* ---- button monitor task ---- */
@@ -1232,7 +1451,7 @@ static void ptt_task(void *arg)
                 suppress_ = false;  /* fresh press, clear any stale flag */
             } else if (claimed_) {
                 /* release edge */
-                rec_stop_and_send();
+                rec_stop();
                 claimed_ = false;
                 suppress_ = false;
             } else {
@@ -1277,21 +1496,21 @@ static void ptt_task(void *arg)
             /* safety cap: auto-release at PTT_MAX_MS */
             if ((esp_timer_get_time() - rec_start_us_) / 1000 >= PTT_MAX_MS) {
                 stop_reason_ = "cap";
-                rec_stop_and_send();
+                rec_stop();
                 claimed_ = false;
                 ext_active_ = false;
             } else if (ext_active_ && vad_stop_) {
                 /* v0.4.44: dynamic silence / no-speech stop —
                  * stop_reason_ was set by rec_feed ("silence" or
                  * "no_speech"). */
-                rec_stop_and_send();
+                rec_stop();
                 claimed_ = false;
                 ext_active_ = false;
             } else if (ext_active_ && ext_stop_) {
                 /* Wake-word auto-PTT: explicit stop (wheel-click or host). */
                 stop_reason_ = "stop";
                 ext_stop_ = false;
-                rec_stop_and_send();
+                rec_stop();
                 ext_active_ = false;
             }
             continue;
@@ -1347,6 +1566,21 @@ esp_err_t ptt_init(void)
      * I2S DMA buffers are allocated separately with MALLOC_CAP_DMA. */
     task_psram_ = task_psram_create(ptt_task, "ptt", 4096, NULL, 5, tskNO_AFFINITY);
     ESP_RETURN_ON_FALSE(task_psram_ != NULL, ESP_FAIL, TAG, "task create");
+
+    /* v0.4.49: streaming shipper plumbing — ring allocated once,
+     * sender task created once (see the ship block above for why
+     * never per-take). take_done_ starts given: no take in flight. */
+    ship_ring_ = heap_caps_malloc(SHIP_RING_CAP, MALLOC_CAP_SPIRAM);
+    ship_q_ = xQueueCreate(4, sizeof(ship_msg_t));
+    take_done_ = xSemaphoreCreateBinary();
+    ESP_RETURN_ON_FALSE(ship_ring_ && ship_q_ && take_done_, ESP_FAIL,
+                        TAG, "ship plumbing alloc");
+    xSemaphoreGive(take_done_);
+    ship_task_psram_ = task_psram_create(ship_task, "ptt_ship", 8192,
+                                         NULL, 4, tskNO_AFFINITY);
+    ESP_RETURN_ON_FALSE(ship_task_psram_ != NULL, ESP_FAIL, TAG,
+                        "ship task create");
+    ship_task_ = ship_task_psram_->task;
 
     ready_ = true;
     ESP_LOGI(TAG, "ready (hold wheel >%dms to talk)", PTT_HOLD_MS);

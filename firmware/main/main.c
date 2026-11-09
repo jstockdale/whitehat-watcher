@@ -32,7 +32,7 @@
 #include "wakeword.h"
 
 static const char *TAG = "main";
-#define FW_VERSION "0.4.48"
+#define FW_VERSION "0.4.49"
 
 /* v0.4.18.72 (Claude btmon 2026-10-08): BLE GAP callbacks run in the NimBLE
  * host task context. Doing I/O there (display, link_send, MQTT) blocks the

@@ -424,7 +424,14 @@ esp_err_t eyes_init(void)
         .scl_io_num = PIN_I2C_SCL,
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 400000,
+        /* v0.4.48.1: 100 kHz, not 400 kHz. I2C0 carries only the
+         * expander and codec control — nothing here needs fast-mode
+         * speed — and the recurring interrupt-WDT panic RCA
+         * (2026-11-09) implicates marginal-bus transaction timeouts
+         * at 400 kHz as the trigger that drops the legacy driver
+         * into its FSM-reset path. Standard mode quadruples the
+         * timing margins for ~zero functional cost. */
+        .master.clk_speed = 100000,
     };
     if (i2c_param_config(I2C_NUM_0, &i2c_cfg) != ESP_OK ||
         i2c_driver_install(I2C_NUM_0, i2c_cfg.mode, 0, 0, 0) != ESP_OK) {

@@ -9,6 +9,15 @@ Firmware sends (via link -> console -> MQTT):
     {"t":"audio","id":<ms>,"seq":N,"total":M,"ms":<dur>,"data":"<b64>"}
     {"t":"audio_end","id":<ms>,"chunks":M,"ms":<dur>}
 
+Streaming firmware (0.4.49+, docs/audio-streaming-design-2026-11-09.md)
+OMITS "total" on every chunk except the final one — the count is
+unknowable until the take ends. This handler therefore treats total
+as optional: a slot's total stays unknown (None) until a chunk
+carries one or audio_end supplies the authoritative count, and the
+opportunistic completion below only fires on a KNOWN total.
+Pre-0.4.49 firmware sends total on every chunk; behavior for it is
+unchanged.
+
 These arrive either on the dedicated watcher/audio topic (preferred) or
 embedded as raw JSON inside watcher/telemetry events (current console).
 feed() accepts both shapes.
@@ -97,24 +106,36 @@ class AudioReassembler:
         if t == "audio":
             uid = str(msg.get("id"))
             seq = int(msg.get("seq", 0))
-            total = int(msg.get("total", 1))
+            raw_total = msg.get("total")
+            total = int(raw_total) if raw_total is not None else None
             try:
                 raw = base64.b64decode(msg.get("data", ""))
             except Exception:
                 return None
             slot = self._pending.setdefault(
-                uid, {"chunks": {}, "total": total, "ms": msg.get("ms", 0)})
+                uid, {"chunks": {}, "total": None, "ms": msg.get("ms", 0)})
             slot["chunks"][seq] = raw
-            slot["total"] = total
+            if total is not None:
+                slot["total"] = total
             slot["ms"] = msg.get("ms", slot["ms"])
             slot["last_at"] = time.time()
-            # opportunistic completion: all chunks arrived before audio_end
-            if len(slot["chunks"]) >= total:
+            # Opportunistic completion: all chunks arrived before
+            # audio_end. Only on a KNOWN total — streaming chunks
+            # carry none until the final one (0.4.49+).
+            if slot["total"] is not None and \
+                    len(slot["chunks"]) >= slot["total"]:
                 return self._complete(uid)
             return None
         if t == "audio_end":
             uid = str(msg.get("id"))
             if uid in self._pending:
+                slot = self._pending[uid]
+                # audio_end's chunk count is authoritative when no
+                # chunk carried a total (streaming firmware whose
+                # final chunk was the one that got away).
+                if slot["total"] is None and \
+                        msg.get("chunks") is not None:
+                    slot["total"] = int(msg["chunks"])
                 return self._complete(uid)
             return None
         return None
@@ -146,8 +167,13 @@ class AudioReassembler:
         slot = self._pending.pop(uid, None)
         if not slot:
             return None
-        total = slot["total"]
         chunks = slot["chunks"]
+        # Total may still be unknown (sweep completion of a streamed
+        # take whose final chunk AND audio_end both went missing):
+        # report against what actually arrived rather than inventing
+        # a denominator.
+        total = slot["total"] if slot["total"] is not None \
+            else len(chunks)
         if len(chunks) < total:
             missing = sorted(set(range(total)) - set(chunks))
             print(f"[audio] id={uid}: missing chunks {missing}, "
