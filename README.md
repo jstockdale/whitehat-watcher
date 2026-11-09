@@ -475,4 +475,4 @@ is correct behavior.) Full record:
 
 <p align="center"><img src="docs/assets/mascot.png" alt="Nobody, the lighthouse mascot" width="140"></p>
 
-<p align="center"><em>Nobody — the lighthouse on the badge, and the project's mascot. He does the watching.</em></p>
+<p align="center"><em>Nobody — the lighthouse on the badge, and the project's mascot — is watching. 😉</em></p>
