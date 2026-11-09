@@ -62,7 +62,8 @@ TOPIC_PREFIX = os.environ.get("MQTT_TOPIC") or "watcher"
 
 DBG_ALLOWED = {"version", "mem", "heap", "tasks", "pwr", "i2c",
                "touch", "wheel", "pointer", "spitest",
-               "eyes", "at", "snaptest", "png", "crop", "strip"}
+               "eyes", "at", "snaptest", "png", "crop", "strip",
+               "wakeword", "codec", "loopback", "rings"}
 
 # HID input class: approved by John 2026-09-23 for the eyes-drive-cursor
 # loop. Standing rule: NEVER send one without his explicit per-use
@@ -83,16 +84,31 @@ def allowed(cmd) -> bool:
     t = cmd.get("t")
     if t == "ping":
         return set(cmd.keys()) == {"t"}
+    if t == "baud":
+        return (set(cmd.keys()) == {"t", "rate"}
+                and cmd.get("rate") in (115200, 230400, 460800, 921600))
     if t == "logs":
         n = cmd.get("n")
         return (set(cmd.keys()) == {"t", "n"}
                 and isinstance(n, int) and not isinstance(n, bool)
                 and 1 <= n <= 100)
     if t == "dbg":
+        if cmd.get("cmd") == "wakeword":
+            # wakeword is the one state-changing dbg subcommand: its
+            # whole job is the on/off toggle (John-approved for the
+            # 0.4.37 Hey Muse live test). Bare form = status query.
+            return (set(cmd.keys()) <= {"t", "cmd", "on"}
+                    and cmd.get("on", 0) in (0, 1))
         return (cmd.get("cmd") in DBG_ALLOWED
                 and not any(k in cmd for k in ("on", "v", "color")))
     if t in HID_ALLOWED:
         return True
+    if t == "reply":
+        # Host's short reply to a voice take (console 0.4.188 /
+        # firmware 0.4.45): shown paced on the device screen.
+        text = cmd.get("text")
+        return (set(cmd.keys()) == {"t", "text"}
+                and isinstance(text, str) and 1 <= len(text) <= 1000)
     if t == "himax_at":
         at = cmd.get("at")
         return (set(cmd.keys()) == {"t", "at"}
@@ -210,6 +226,9 @@ def main() -> None:
             sealed = seal_client.seal_command(cmd_id, cmd, command_topic)
             envelope = json.dumps({"sealed": sealed["sealed"]})
             sealed_info = (f" [sealed ctr={sealed['ctr']}]")
+            if "resync" in sealed:
+                sealed_info += (f" [floor-synced {sealed['resync']['from']}"
+                                f"->{sealed['resync']['floor']}]")
         except FileNotFoundError as e:
             print(f"seal key not found ({e}); run seal_keygen.py once, "
                   f"or use --no-seal for grace-mode unsigned send")

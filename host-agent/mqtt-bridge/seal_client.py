@@ -17,12 +17,24 @@ anti-oracle cap (refuses floor > own + 2^20). The floor source is
 the verifier's status: Phase 2 firmware reports seal_floor;
 Phase 1 page reports seal_hw in watcher/status.
 
+AUTO-RESYNC (2026-11-09): seal_command() now does this itself. Before
+incrementing, it reads the freshest seal_floor from the bridge's
+telemetry.log — a value that arrived over the MAC-authenticated
+telemetry channel, so it carries the same trust as the manual ritual
+it replaces — and resyncs forward when the device is ahead. Floors
+older than FLOOR_MAX_AGE_S are ignored (bridge down = no fresh word
+from the device = fall back to our own counter, exactly the old
+behavior). A resync failure never blocks a send: it warns and seals
+from the persisted counter. The manual --resync stays for forensics,
+and --auto-resync runs the same path once, verbosely.
+
 Key material lives in ~/.ssh/ (0600). The counter lives in
 ~/.ssh/watcher_seal_ctr and is fsync'd on every increment.
 """
 import base64
 import json
 import os
+import re
 import stat
 import sys
 import time
@@ -91,16 +103,96 @@ def resync_counter(floor):
     return new
 
 
+TELEMETRY_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "telemetry.log")
+FLOOR_MAX_AGE_S = 120        # log mtime fresher than this = bridge alive
+_FLOOR_RE = re.compile(r'"seal_floor"\s*:\s*(\d+)')
+
+
+def latest_telemetry_floor(log_path=TELEMETRY_LOG,
+                           max_age_s=FLOOR_MAX_AGE_S):
+    """Best estimate of the device's seal floor from the telemetry log.
+
+    The value originates from the device's MAC-authenticated
+    telemetry (seal_status replies and the boot-time ready line),
+    relayed verbatim by the bridge subscriber into the log.
+
+    Aggregation is MAX over a generous log tail, not last-line-wins,
+    for three measured reasons (2026-11-09):
+      * floor lines are sparse (~14 in 8 MB of log) — a narrow tail
+        can hold none at all;
+      * the page-side seal_status can report 0 before it loads its
+        high-water, and a 0 must never mask the device's real floor;
+      * floors are monotonic — every reported value is a lower bound
+        on the current floor, so the max is the best estimator and
+        can never overshoot the device's true floor.
+    Freshness is gated on the log file's mtime (filesystem truth,
+    timezone-free): a bridge that has stopped writing has no fresh
+    word from the device. The log's line timestamps are deliberately
+    NOT compared against the local clock — the subscriber stamps in
+    UTC while this host's wall clock is local, and any fixed
+    assumption about either breaks silently.
+    """
+    try:
+        st = os.stat(log_path)
+    except OSError:
+        return None
+    if time.time() - st.st_mtime > max_age_s:
+        return None
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(max(0, st.st_size - (16 << 20)))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    floors = [int(m.group(1)) for m in _FLOOR_RE.finditer(tail)]
+    return max(floors) if floors else None
+
+
+def auto_resync(log_path=TELEMETRY_LOG):
+    """Forward-only resync from the freshest telemetry floor.
+
+    Returns (own_before, applied_floor) when the counter moved,
+    (own, own) when already ahead, or None when no fresh floor is
+    available. Raises ValueError only from resync_counter's
+    anti-oracle refusal — callers decide whether that is fatal.
+    """
+    floor = latest_telemetry_floor(log_path)
+    if floor is None:
+        return None
+    own = read_counter()
+    if floor <= own:
+        return (own, own)
+    resync_counter(floor)
+    return (own, floor)
+
+
 def seal_command(cmd_id, cmd, topic="watcher/command"):
-    """Seal {"id": cmd_id, "cmd": cmd} -> {"sealed": base64_envelope}."""
+    """Seal {"id": cmd_id, "cmd": cmd} -> {"sealed": base64_envelope}.
+
+    Auto-resyncs the replay counter from the freshest telemetry
+    floor first (see module docstring); a floor problem never blocks
+    the send — it warns on stderr and seals from the persisted
+    counter, which is the pre-auto-resync behavior.
+    """
+    synced = None
+    try:
+        r = auto_resync()
+        if r is not None and r[1] > r[0]:
+            synced = r
+    except Exception as e:  # anti-oracle refusal or log weirdness
+        print("seal auto-resync skipped: %s" % e, file=sys.stderr)
     body = json.dumps({"id": cmd_id, "cmd": cmd},
                       separators=(",", ":")).encode()
     ctr = next_counter()
     ts_ms = int(time.time() * 1000)
     env = mqs.seal_control(topic, COMMANDER_ID, ctr, ts_ms, body,
                            load_signing_key())
-    return {"sealed": base64.b64encode(env).decode("ascii"),
-            "ctr": ctr, "ts_ms": ts_ms}
+    out = {"sealed": base64.b64encode(env).decode("ascii"),
+           "ctr": ctr, "ts_ms": ts_ms}
+    if synced is not None:
+        out["resync"] = {"from": synced[0], "floor": synced[1]}
+    return out
 
 
 if __name__ == "__main__":
@@ -113,5 +205,26 @@ if __name__ == "__main__":
             sys.exit(1)
         print("counter resynced to %d" % new)
         sys.exit(0)
-    print("usage: seal_client.py --resync <floor>", file=sys.stderr)
+    # --auto-resync: run the seal_command() floor sync once, verbosely.
+    if len(sys.argv) == 2 and sys.argv[1] == "--auto-resync":
+        floor = latest_telemetry_floor()
+        if floor is None:
+            print("no fresh seal_floor in telemetry.log "
+                  "(bridge down or device silent); counter unchanged "
+                  "at %d" % read_counter())
+            sys.exit(0)
+        try:
+            r = auto_resync()
+        except ValueError as e:
+            print("auto-resync refused: %s" % e, file=sys.stderr)
+            sys.exit(1)
+        if r is not None and r[1] > r[0]:
+            print("counter resynced %d -> %d (telemetry floor)"
+                  % (r[0], r[1]))
+        else:
+            print("counter %d already >= telemetry floor %d; no move"
+                  % (read_counter(), floor))
+        sys.exit(0)
+    print("usage: seal_client.py --resync <floor> | --auto-resync",
+          file=sys.stderr)
     sys.exit(2)

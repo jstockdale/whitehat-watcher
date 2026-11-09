@@ -107,6 +107,7 @@ class AudioReassembler:
             slot["chunks"][seq] = raw
             slot["total"] = total
             slot["ms"] = msg.get("ms", slot["ms"])
+            slot["last_at"] = time.time()
             # opportunistic completion: all chunks arrived before audio_end
             if len(slot["chunks"]) >= total:
                 return self._complete(uid)
@@ -117,6 +118,29 @@ class AudioReassembler:
                 return self._complete(uid)
             return None
         return None
+
+    def sweep(self, max_age_s: float = 45.0) -> list:
+        """Complete takes that have gone quiet for max_age_s seconds.
+
+        A take whose audio_end (or some chunks) never arrives would
+        otherwise sit in _pending forever and its audio would be lost
+        silently — field case 2026-11-07: take 80682 parked incomplete
+        while only its loss was visible in the logs. Expiry is based on
+        last activity, so a slow-but-alive take (chunks still arriving)
+        is never cut off; _complete already decodes partial takes and
+        logs the missing chunk list. Returns the WAV paths written."""
+        now = time.time()
+        stale = [uid for uid, slot in self._pending.items()
+                 if now - slot.get("last_at", now) >= max_age_s]
+        out = []
+        for uid in stale:
+            print(f"[audio] id={uid}: no activity for "
+                  f"{max_age_s:.0f}s, completing partial take",
+                  flush=True)
+            wav = self._complete(uid)
+            if wav:
+                out.append(wav)
+        return out
 
     def _complete(self, uid: str) -> str | None:
         slot = self._pending.pop(uid, None)

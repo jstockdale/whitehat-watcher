@@ -15,6 +15,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -92,6 +93,23 @@ static bool msg_visible_ = false;
  * 2=media), so dismiss restores it. */
 static int msg_return_to_ = 0;
 static char *msg_text_ = NULL; /* PSRAM buffer for the message text */
+
+/* v0.4.45: paced reveal — a host reply appears at reading speed
+ * (~18 chars/s, snapped forward to word boundaries so words never
+ * split) instead of dumping the whole text at once, then
+ * auto-dismisses MSG_HOLD_MS after the reveal completes. A wheel
+ * scroll cancels the auto-dismiss (the user is reading); a click
+ * dismisses immediately, as before. */
+static char *msg_shown_ = NULL; /* PSRAM prefix buffer for the reveal */
+static esp_timer_handle_t msg_timer_ = NULL;
+static int64_t msg_reveal_start_us_ = 0;
+static size_t msg_reveal_len_ = 0;
+static bool msg_reveal_done_ = false;
+static int64_t msg_hide_at_us_ = 0; /* 0 = no auto-dismiss pending */
+#define MSG_REVEAL_CPS 18
+#define MSG_HOLD_MS 15000   /* John 2026-11-08: 6 s was too easy to miss;
+                             * scroll cancels the timer, click dismisses. */
+static void msg_tick_(void *arg);
 
 /* QSPI partial flushes must start/end on 4-px x boundaries. */
 static void rounder_cb(struct _lv_disp_drv_t *disp_drv, lv_area_t *area)
@@ -418,9 +436,17 @@ static void build_ui(void)
     lv_obj_add_flag(msg_cont_, LV_OBJ_FLAG_HIDDEN);
 
     msg_label_ = lv_label_create(msg_cont_);
-    /* Inset from the round edges: 40px sides, 60px top/bottom. */
-    lv_obj_set_width(msg_label_, 412 - 80);
-    lv_obj_set_pos(msg_label_, 40, 60);
+    /* Inset to the MEASURED safe circle (v0.4.47): the ring test
+     * (0.4.46) showed the full r=200 circle visible with a sharp
+     * black band beyond it, so UI must inscribe in r<=196. The old
+     * geometry (x=40, y=60, w=332) put the label's top corner at
+     * radius 221 — outside the panel — which clipped the first
+     * characters of the first line ("It" in "It does!", 2026-11-08).
+     * Now: width 288 centered (x=62), top y=96 — corner radius 181,
+     * and every line of the first screenful (to y=336) inside the
+     * safe circle. */
+    lv_obj_set_width(msg_label_, 288);
+    lv_obj_set_pos(msg_label_, 62, 96);
     lv_label_set_long_mode(msg_label_, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_font(msg_label_, &lv_font_montserrat_22, 0);
     lv_obj_set_style_text_color(msg_label_, lv_color_white(), 0);
@@ -776,8 +802,31 @@ void display_show_message(const char *text)
             return;
         }
     }
+    if (!msg_shown_) {
+        msg_shown_ = heap_caps_malloc(MSG_MAX_LEN, MALLOC_CAP_SPIRAM);
+        if (!msg_shown_) {
+            return;
+        }
+    }
     strncpy(msg_text_, text, MSG_MAX_LEN - 1);
     msg_text_[MSG_MAX_LEN - 1] = '\0';
+
+    /* v0.4.45: (re)start the paced reveal from the top. */
+    msg_reveal_len_ = 0;
+    msg_reveal_done_ = false;
+    msg_hide_at_us_ = 0;
+    msg_reveal_start_us_ = esp_timer_get_time();
+    msg_shown_[0] = '\0';
+    if (!msg_timer_) {
+        const esp_timer_create_args_t targs = {
+            .callback = msg_tick_,
+            .name = "msg_reveal",
+        };
+        esp_timer_create(&targs, &msg_timer_);
+    }
+    if (msg_timer_ && !esp_timer_is_active(msg_timer_)) {
+        esp_timer_start_periodic(msg_timer_, 100 * 1000);
+    }
 
     if (lvgl_port_lock(0)) {
         if (!msg_visible_) {
@@ -794,7 +843,7 @@ void display_show_message(const char *text)
             lv_obj_add_flag(media_cont_, LV_OBJ_FLAG_HIDDEN);
             kb_visible_ = false;
         }
-        lv_label_set_text(msg_label_, msg_text_);
+        lv_label_set_text(msg_label_, msg_shown_);
         /* Scroll back to the top for a new message. */
         lv_obj_scroll_to_y(msg_cont_, 0, LV_ANIM_OFF);
         lv_obj_clear_flag(msg_cont_, LV_OBJ_FLAG_HIDDEN);
@@ -810,6 +859,11 @@ void display_hide_message(void)
     if (!ready_ || !msg_cont_ || !msg_visible_) {
         return;
     }
+    /* v0.4.45: the reveal/hold timer's work is done. */
+    if (msg_timer_ && esp_timer_is_active(msg_timer_)) {
+        esp_timer_stop(msg_timer_);
+    }
+    msg_hide_at_us_ = 0;
     if (lvgl_port_lock(0)) {
         lv_obj_add_flag(msg_cont_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(msg_hint_, LV_OBJ_FLAG_HIDDEN);
@@ -839,11 +893,200 @@ void display_message_scroll(int detents)
     if (!ready_ || !msg_cont_ || !msg_visible_) {
         return;
     }
+    /* v0.4.45: the user is reading — cancel the auto-dismiss. */
+    msg_hide_at_us_ = 0;
     if (lvgl_port_lock(0)) {
         /* 40px per detent — about two lines at 22pt. */
         lv_obj_scroll_by(msg_cont_, 0, -detents * 40, LV_ANIM_OFF);
         lvgl_port_unlock();
     }
+}
+
+/* v0.4.45: paced-reveal tick (100 ms). Advances the visible prefix
+ * at MSG_REVEAL_CPS, snapped forward to word boundaries; when the
+ * text is fully shown, arms the auto-dismiss hold; when the hold
+ * expires, dismisses the message. Self-stops when the view is gone
+ * (click-dismiss also stops the timer in display_hide_message). */
+static void msg_tick_(void *arg)
+{
+    (void)arg;
+    if (!msg_visible_ || !msg_text_) {
+        if (msg_timer_) {
+            esp_timer_stop(msg_timer_);
+        }
+        return;
+    }
+    int64_t now = esp_timer_get_time();
+    if (!msg_reveal_done_) {
+        size_t total = strlen(msg_text_);
+        size_t target = (size_t)((now - msg_reveal_start_us_) / 1000 *
+                                 MSG_REVEAL_CPS / 1000);
+        if (target >= total) {
+            target = total;
+        } else {
+            while (target < total && msg_text_[target] != ' ' &&
+                   msg_text_[target] != '\n') {
+                target++;
+            }
+            if (target < total) {
+                target++; /* include the separator */
+            }
+        }
+        if (target != msg_reveal_len_) {
+            msg_reveal_len_ = target;
+            memcpy(msg_shown_, msg_text_, target);
+            msg_shown_[target] = '\0';
+            if (lvgl_port_lock(0)) {
+                lv_label_set_text(msg_label_, msg_shown_);
+                /* Auto-scroll to follow the reveal frontier (John,
+                 * 2026-11-08): a message longer than the screen
+                 * reveals downward — keep the newest line on the
+                 * glass. Label sits at y=96 in the full-screen scroll
+                 * container; scroll just enough that the revealed
+                 * bottom (+24 px) is visible, never backward. */
+                lv_obj_update_layout(msg_label_);
+                lv_coord_t content_bottom =
+                    96 + lv_obj_get_height(msg_label_) + 24;
+                if (content_bottom > 412) {
+                    lv_coord_t target_y = content_bottom - 412;
+                    if (target_y > lv_obj_get_scroll_y(msg_cont_)) {
+                        lv_obj_scroll_to_y(msg_cont_, target_y, LV_ANIM_OFF);
+                    }
+                }
+                lvgl_port_unlock();
+            }
+        }
+        if (target >= total) {
+            msg_reveal_done_ = true;
+            if (msg_hide_at_us_ == 0) {
+                msg_hide_at_us_ = now + (int64_t)MSG_HOLD_MS * 1000;
+            }
+        }
+        return;
+    }
+    if (msg_hide_at_us_ && now >= msg_hide_at_us_) {
+        msg_hide_at_us_ = 0;
+        display_hide_message();
+    }
+}
+
+/* ---- v0.4.46: visible-area ring diagnostic ---- */
+
+static lv_obj_t *ring_cont_ = NULL;
+static bool ring_visible_ = false;
+
+/* Radius (px) -> color, outermost first. Distinct, nameable colors
+ * so the visible/clipped boundary can be reported by eye. */
+static const struct { int r; uint32_t color; } RING_TABLE[] = {
+    {200, 0xFF0000}, {190, 0xFF7F00}, {180, 0xFFFF00}, {170, 0x7FFF00},
+    {160, 0x00FF00}, {150, 0x00FF7F}, {140, 0x00FFFF}, {130, 0x007FFF},
+    {120, 0x0000FF}, {110, 0x7F00FF}, {100, 0xFF00FF}, { 90, 0xFF007F},
+    { 80, 0xFFFFFF}, { 70, 0xC0C0C0}, { 60, 0x808080}, { 50, 0x800000},
+    { 40, 0x808000}, { 30, 0x000080},
+};
+
+static void ring_label_(int x, int y, int r, bool dark_text)
+{
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d", r);
+    lv_obj_t *l = lv_label_create(ring_cont_);
+    lv_label_set_text(l, buf);
+    lv_obj_set_pos(l, x, y);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(l, dark_text ? lv_color_black()
+                                             : lv_color_white(), 0);
+}
+
+static void ring_build_(void)
+{
+    ring_cont_ = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(ring_cont_, 412, 412);
+    lv_obj_set_pos(ring_cont_, 0, 0);
+    lv_obj_set_style_bg_color(ring_cont_, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(ring_cont_, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(ring_cont_, 0, 0);
+    lv_obj_set_style_pad_all(ring_cont_, 0, 0);
+    lv_obj_clear_flag(ring_cont_, LV_OBJ_FLAG_SCROLLABLE);
+    /* Rings, largest first so smaller ones stack on top. */
+    for (size_t i = 0; i < sizeof(RING_TABLE) / sizeof(RING_TABLE[0]); i++) {
+        int r = RING_TABLE[i].r;
+        lv_obj_t *o = lv_obj_create(ring_cont_);
+        lv_obj_set_size(o, 2 * r, 2 * r);
+        lv_obj_set_pos(o, 206 - r, 206 - r);
+        lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(o, lv_color_hex(RING_TABLE[i].color), 0);
+        lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(o, 0, 0);
+        lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    }
+    /* Crosshair through the center (dark gray, visible on all rings). */
+    lv_obj_t *h = lv_obj_create(ring_cont_);
+    lv_obj_set_size(h, 412, 2);
+    lv_obj_set_pos(h, 0, 205);
+    lv_obj_set_style_bg_color(h, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_border_width(h, 0, 0);
+    lv_obj_t *v = lv_obj_create(ring_cont_);
+    lv_obj_set_size(v, 2, 412);
+    lv_obj_set_pos(v, 205, 0);
+    lv_obj_set_style_bg_color(v, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_border_width(v, 0, 0);
+    /* Radius numbers at 3 o'clock (every 20 px) and 12 o'clock
+     * (every 40 px): text sits just inside its ring's edge. */
+    for (size_t i = 0; i < sizeof(RING_TABLE) / sizeof(RING_TABLE[0]); i++) {
+        int r = RING_TABLE[i].r;
+        uint32_t c = RING_TABLE[i].color;
+        /* Crude luminance: dark text on bright rings. */
+        int lum = (int)((c >> 16 & 0xFF) * 3 + (c >> 8 & 0xFF) * 5 +
+                        (c & 0xFF) * 2) / 10;
+        if (r % 20 == 0) {
+            ring_label_(206 + r - 36, 206 - 20, r, lum > 110);
+        }
+        if (r % 40 == 0) {
+            ring_label_(206 - 13, 206 - r + 3, r, lum > 110);
+        }
+    }
+    lv_obj_add_flag(ring_cont_, LV_OBJ_FLAG_HIDDEN);
+}
+
+void display_show_ring_test(void)
+{
+    if (!ready_) {
+        return;
+    }
+    if (msg_visible_) {
+        display_hide_message();
+    }
+    if (lvgl_port_lock(0)) {
+        if (!ring_cont_) {
+            ring_build_();
+        }
+        lv_obj_add_flag(status_cont_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(kb_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(media_cont_, LV_OBJ_FLAG_HIDDEN);
+        kb_visible_ = false;
+        lv_obj_clear_flag(ring_cont_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(ring_cont_);
+        ring_visible_ = true;
+        lvgl_port_unlock();
+    }
+}
+
+void display_hide_ring_test(void)
+{
+    if (!ready_ || !ring_cont_ || !ring_visible_) {
+        return;
+    }
+    if (lvgl_port_lock(0)) {
+        lv_obj_add_flag(ring_cont_, LV_OBJ_FLAG_HIDDEN);
+        ring_visible_ = false;
+        lv_obj_clear_flag(status_cont_, LV_OBJ_FLAG_HIDDEN);
+        lvgl_port_unlock();
+    }
+}
+
+bool display_ring_test_visible(void)
+{
+    return ring_visible_;
 }
 
 

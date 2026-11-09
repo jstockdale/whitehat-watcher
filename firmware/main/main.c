@@ -32,7 +32,7 @@
 #include "wakeword.h"
 
 static const char *TAG = "main";
-#define FW_VERSION "0.4.23"
+#define FW_VERSION "0.4.48"
 
 /* v0.4.18.72 (Claude btmon 2026-10-08): BLE GAP callbacks run in the NimBLE
  * host task context. Doing I/O there (display, link_send, MQTT) blocks the
@@ -231,7 +231,7 @@ static void on_ble_pair_ui(uint32_t gen, hid_ble_pair_ui_t what, uint32_t number
 }
 
 static bool on_snaptest_chunk(int id, const char *mid, int seq, int total,
-                              const char *b64)
+                              const char *b64, uint32_t crc)
 {
     /* v0.4.18.81 (John 2026-10-08): Watermark flow control. Block until
      * ring has space — paces the PNG encoder to the USB drain rate.
@@ -244,58 +244,126 @@ static bool on_snaptest_chunk(int id, const char *mid, int seq, int total,
      * v0.4.18.88 (2026-10-08): Pass exact required bytes. The old 50%
      * watermark (6KB free) was insufficient for 11KB chunk JSONs — the
      * ring_push_nb overwrote, truncating the base64. */
-    size_t need = strlen(b64) + 128;  /* b64 + JSON overhead */
+    size_t need = strlen(b64) + 160;  /* b64 + JSON overhead (+crc v0.35) */
     if (!link_wait_for_ring_space(60000, need)) {
         ESP_LOGE("main", "snaptest: ring stuck full, ABORTING PNG transfer at chunk %d", seq);
         return false;
     }
-    cJSON *o = link_new_event("snaptest_chunk");
-    cJSON_AddNumberToObject(o, "id", id);
-    if (mid && mid[0]) {
-        cJSON_AddStringToObject(o, "_mid", mid);
+    /* v0.4.35: ack'd streaming (opt-in via the snaptest command's
+     * "ack":1; armed in link.c). Emit one chunk, then wait for the
+     * host's chunk_ack before returning — the encoder cannot run
+     * ahead of the receiver, so receive flooding (console 0.4.178
+     * field failure: gaps widening from seq ~64) becomes impossible.
+     * A nack (host got the chunk but it failed validation) or the
+     * baud-aware timeout resends the SAME chunk; 5 sends total, then
+     * abort the stream with a snaptest_chunk_error event. Legacy
+     * hosts never arm the gate and see exactly the old behavior. */
+    bool ack_mode = link_chunk_ack_active();
+    char crcbuf[9];
+    snprintf(crcbuf, sizeof(crcbuf), "%08x", (unsigned)crc);
+    for (int attempt = 0; ; attempt++) {
+        if (ack_mode) {
+            link_chunk_ack_note_send();
+        }
+        cJSON *o = link_new_event("snaptest_chunk");
+        cJSON_AddNumberToObject(o, "id", id);
+        if (mid && mid[0]) {
+            cJSON_AddStringToObject(o, "_mid", mid);
+        }
+        cJSON_AddNumberToObject(o, "seq", seq);
+        cJSON_AddNumberToObject(o, "total", total);
+        /* v0.4.18.70 (Claude F6e): Removed "last" field. In streaming mode
+         * total=-1, so seq==total-1 is never true. Page uses IEND chunk. */
+        /* v0.4.21: blen = expected b64 length, so receivers can pinpoint a
+         * truncated chunk deterministically (chunk-loss RCA 2026-11-02). */
+        cJSON_AddNumberToObject(o, "blen", (double)strlen(b64));
+        /* v0.4.35: CRC32 of the raw chunk bytes so the host can verify
+         * the chunk before acking (a bit-flipped b64 payload still
+         * parses as JSON — blen alone can't catch that). */
+        cJSON_AddStringToObject(o, "crc", crcbuf);
+        cJSON_AddStringToObject(o, "b64", b64);
+        /* v0.4.21: a failed send (ring push dropped the line) aborts the
+         * encode — never silently ship a holed image. */
+        if (link_send(o) != ESP_OK) {
+            ESP_LOGE("main", "snaptest: chunk %d send failed, ABORTING PNG transfer", seq);
+            return false;
+        }
+        if (!ack_mode) {
+            return true;
+        }
+        if (link_chunk_ack_wait(id, seq, strlen(b64) + 128)) {
+            return true;
+        }
+        if (attempt >= 4) {
+            ESP_LOGE("main", "snaptest: chunk %d unacked after %d sends, ABORTING PNG transfer", seq, attempt + 1);
+            cJSON *e = link_new_event("snaptest_chunk_error");
+            cJSON_AddNumberToObject(e, "id", id);
+            cJSON_AddNumberToObject(e, "seq", seq);
+            cJSON_AddStringToObject(e, "msg",
+                                    "chunk not acknowledged by host");
+            link_send(e);
+            return false;
+        }
+        ESP_LOGW("main", "snaptest: chunk %d unacked/nacked — resending (send %d)", seq, attempt + 2);
     }
-    cJSON_AddNumberToObject(o, "seq", seq);
-    cJSON_AddNumberToObject(o, "total", total);
-    /* v0.4.18.70 (Claude F6e): Removed "last" field. In streaming mode
-     * total=-1, so seq==total-1 is never true. Page uses IEND chunk. */
-    /* v0.4.21: blen = expected b64 length, so receivers can pinpoint a
-     * truncated chunk deterministically (chunk-loss RCA 2026-11-02). */
-    cJSON_AddNumberToObject(o, "blen", (double)strlen(b64));
-    cJSON_AddStringToObject(o, "b64", b64);
-    /* v0.4.21: a failed send (ring push dropped the line) aborts the
-     * encode — never silently ship a holed image. */
-    if (link_send(o) != ESP_OK) {
-        ESP_LOGE("main", "snaptest: chunk %d send failed, ABORTING PNG transfer", seq);
-        return false;
-    }
-    return true;
 }
 
 /* v0.4.14 (P2): PNG capture chunks -> {t:"png_chunk"} events. */
-static bool on_png_chunk(int seq, int total, const char *b64)
+static bool on_png_chunk(int seq, int total, const char *b64, uint32_t crc)
 {
     /* v0.4.18.81: Watermark flow control (see on_snaptest_chunk).
      * v0.4.18.84: 60s timeout, blocking is correct.
      * v0.4.18.84 (John 2026-10-08): Return false on timeout to ABORT.
      * A dropped chunk corrupts the PNG.
      * v0.4.18.88: Pass exact required bytes (see on_snaptest_chunk). */
-    size_t need = strlen(b64) + 128;
+    size_t need = strlen(b64) + 160;
     if (!link_wait_for_ring_space(60000, need)) {
         ESP_LOGE("main", "dbg png: ring stuck full, ABORTING PNG transfer at chunk %d", seq);
         return false;
     }
-    cJSON *o = link_new_event("png_chunk");
-    cJSON_AddNumberToObject(o, "seq", seq);
-    cJSON_AddNumberToObject(o, "total", total);
-    cJSON_AddBoolToObject(o, "last", seq == total - 1);
-    /* v0.4.21: blen + send-failure abort (see on_snaptest_chunk). */
-    cJSON_AddNumberToObject(o, "blen", (double)strlen(b64));
-    cJSON_AddStringToObject(o, "b64", b64);
-    if (link_send(o) != ESP_OK) {
-        ESP_LOGE("main", "dbg png: chunk %d send failed, ABORTING PNG transfer", seq);
-        return false;
+    /* v0.4.35: ack'd streaming, same gate as on_snaptest_chunk but
+     * under the reserved png stream id (see link.h). The event gains
+     * "id" so the host can echo it in chunk_ack/chunk_nack. */
+    bool ack_mode = link_chunk_ack_active();
+    char crcbuf[9];
+    snprintf(crcbuf, sizeof(crcbuf), "%08x", (unsigned)crc);
+    for (int attempt = 0; ; attempt++) {
+        if (ack_mode) {
+            link_chunk_ack_note_send();
+        }
+        cJSON *o = link_new_event("png_chunk");
+        cJSON_AddNumberToObject(o, "id", LINK_PNG_STREAM_ID);
+        cJSON_AddNumberToObject(o, "seq", seq);
+        cJSON_AddNumberToObject(o, "total", total);
+        cJSON_AddBoolToObject(o, "last", seq == total - 1);
+        /* v0.4.21: blen + send-failure abort (see on_snaptest_chunk). */
+        cJSON_AddNumberToObject(o, "blen", (double)strlen(b64));
+        /* v0.4.35: CRC32 of the raw chunk bytes (see on_snaptest_chunk). */
+        cJSON_AddStringToObject(o, "crc", crcbuf);
+        cJSON_AddStringToObject(o, "b64", b64);
+        if (link_send(o) != ESP_OK) {
+            ESP_LOGE("main", "dbg png: chunk %d send failed, ABORTING PNG transfer", seq);
+            return false;
+        }
+        if (!ack_mode) {
+            return true;
+        }
+        if (link_chunk_ack_wait(LINK_PNG_STREAM_ID, seq,
+                                 strlen(b64) + 128)) {
+            return true;
+        }
+        if (attempt >= 4) {
+            ESP_LOGE("main", "dbg png: chunk %d unacked after %d sends, ABORTING PNG transfer", seq, attempt + 1);
+            cJSON *e = link_new_event("png_chunk_error");
+            cJSON_AddNumberToObject(e, "id", LINK_PNG_STREAM_ID);
+            cJSON_AddNumberToObject(e, "seq", seq);
+            cJSON_AddStringToObject(e, "msg",
+                                    "chunk not acknowledged by host");
+            link_send(e);
+            return false;
+        }
+        ESP_LOGW("main", "dbg png: chunk %d unacked/nacked — resending (send %d)", seq, attempt + 2);
     }
-    return true;
 }
 
 /* v0.4.15 (P5): strip capture chunks -> {t:"strip_chunk"} events.
@@ -380,6 +448,8 @@ static void on_eyes_emit(const char *type, int id, const char *mid,
 static void on_snaptest_done(int id, const char *mid,
                              const eyes_snaptest_result_t *res)
 {
+    /* v0.4.35: the stream is over either way — lift the ack gate. */
+    link_chunk_ack_disarm();
     /* Exactly-once terminal replies (see on_eyes_emit). */
     if (!link_pending_done(mid)) {
         ESP_LOGW(TAG, "dropping late snaptest completion (already timed out)");
@@ -415,6 +485,15 @@ static void on_snaptest_done(int id, const char *mid,
 static void on_wakeword_detected(int index)
 {
     ESP_LOGI(TAG, "wake-word detected (index %d): auto-starting PTT", index);
+    /* v0.4.36: an explicit event too, so the console/MQTT can show the
+     * detection (and the count) without parsing log lines. */
+    cJSON *o = link_new_event("wakeword");
+    if (o) {
+        cJSON_AddNumberToObject(o, "index", index);
+        cJSON_AddNumberToObject(o, "count",
+                                (double)wakeword_detection_count());
+        link_send(o);
+    }
     ptt_start_external();
 }
 

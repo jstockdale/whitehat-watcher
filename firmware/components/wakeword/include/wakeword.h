@@ -20,7 +20,7 @@ extern "C" {
 
 /** Detection callback: invoked on the wake-word task when the phrase is
  *  recognized. Default action (set by app): trigger PTT flow. */
-typedef void (*wakeword_cb_t)(void);
+typedef void (*wakeword_cb_t)(int index);
 
 /** Initialize the wake-word component. Does NOT start listening;
  *  call wakeword_set_enabled(true) to activate. Safe no-op if ESP-SR
@@ -36,6 +36,11 @@ bool wakeword_ready(void);
 void wakeword_set_enabled(bool enabled);
 bool wakeword_enabled(void);
 
+/* v0.4.38: true while the feed/fetch tasks are actually running —
+ * distinct from enabled_ (the NVS opt-in), so a dead or un-resumed
+ * listener is visible in the dbg reply instead of silent. */
+bool wakeword_listening(void);
+
 /** Suspend listening and release I2S (called by PTT before recording).
  *  No-op if not enabled or already suspended. */
 esp_err_t wakeword_stop(void);
@@ -49,6 +54,18 @@ void wakeword_set_callback(wakeword_cb_t cb);
 
 /** Lifetime detection count (for diagnostics). */
 uint32_t wakeword_detection_count(void);
+
+/** v0.4.44: level snapshot frozen at the last detection — the ambient
+ *  room RMS (rolling noise-floor estimate from the feed, in PCM sample
+ *  units) and the speech RMS (loudest feed chunk in the ~1.5 s around
+ *  the detection — the wake phrase itself). PTT uses these to derive a
+ *  dynamic silence threshold for the triggered take instead of any
+ *  fixed value: the environment is measured, never assumed. Either
+ *  value is 0 if no detection has happened yet. */
+void wakeword_detect_levels(float *ambient_rms, float *speech_rms);
+
+/** Live ambient floor estimate (0 until the feed has run). */
+float wakeword_ambient_rms(void);
 
 /** Wake-word phrase selection (persisted to NVS). BOTH is the default.
  *  HEY_MUSE / HEY_WATCHER currently fall back to the "Hi, ESP" model

@@ -135,6 +135,11 @@ static void timer_draw(void)
 /** Short-press action for the current mode. */
 static void mode_short_press(void)
 {
+    /* Ring-test diagnostic has input priority: click dismisses it. */
+    if (display_ring_test_visible()) {
+        display_hide_ring_test();
+        return;
+    }
     /* Message overlay has input priority: click dismisses it. */
     if (display_message_visible()) {
         display_hide_message();

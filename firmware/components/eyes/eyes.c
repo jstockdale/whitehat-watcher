@@ -1374,6 +1374,10 @@ static const char *snap_decode_image_(void)
     return NULL;
 }
 
+/* v0.4.35: forward declaration — the definition sits with the base64
+ * helpers further down (see eyes_crc32_ there). */
+static uint32_t eyes_crc32_(const uint8_t *data, size_t len);
+
 /* Stream the captured frame as base64 chunks (768 input bytes -> 1024
  * chars per chunk) through the chunk callback. Only the final chunk can
  * carry RFC 4648 '=' padding. */
@@ -1387,7 +1391,8 @@ static void stream_frame_b64(int id, const char *mid)
         size_t n = len - off > 768 ? 768 : len - off;
         b64_encode_chunk_(snap_buf_ + off, n, b64);
         if (snaptest_chunk_cb_) {
-            snaptest_chunk_cb_(id, mid, seq, total, b64);
+            snaptest_chunk_cb_(id, mid, seq, total, b64,
+                               eyes_crc32_(snap_buf_ + off, n));
         }
     }
 }
@@ -1628,6 +1633,23 @@ static bool png_sink_append(const uint8_t *data, size_t len, void *user)
     return true;
 }
 
+/* v0.4.35: zlib CRC32 (reflected, poly 0xEDB88320, init/final XOR
+ * 0xFFFFFFFF — the "123456789" -> 0xCBF43926 parametrization), bitwise.
+ * A chunk is ~8 KB, so the bit loop costs well under a millisecond and
+ * needs no table. The ack-mode host validates each chunk against this
+ * before acknowledging (see link_chunk_ack_* in link.c). */
+static uint32_t eyes_crc32_(const uint8_t *data, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)-(int32_t)(crc & 1u));
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
 /* v0.4.18.37: Shared helper for base64 chunk encoding.
  * Encodes a 768-byte (or smaller) chunk to base64.
  * Returns the length of the base64 string (excluding NUL). */
@@ -1669,7 +1691,7 @@ static void stream_png_b64(const uint8_t *buf, size_t len)
         size_t n = len - off > 768 ? 768 : len - off;
         b64_encode_chunk_(buf + off, n, b64);
         if (png_chunk_cb_) {
-            png_chunk_cb_(seq, total, b64);
+            png_chunk_cb_(seq, total, b64, eyes_crc32_(buf + off, n));
         }
     }
 }
@@ -1703,7 +1725,8 @@ static bool png_dbg_streaming_sink_cb(const uint8_t *data, size_t len, void *use
      * mode (page assembles until IEND). */
     b64_encode_chunk_(data, len, ctx->b64_tmp);
     /* v0.4.18.84: Abort on transport failure (see png_streaming_sink_cb). */
-    if (!png_chunk_cb_(ctx->seq, -1, ctx->b64_tmp)) {
+    if (!png_chunk_cb_(ctx->seq, -1, ctx->b64_tmp,
+                       eyes_crc32_(data, len))) {
         ctx->failed = true;
         return false;
     }
@@ -1752,7 +1775,8 @@ static bool png_streaming_sink_cb(const uint8_t *data, size_t len, void *user)
     /* v0.4.18.84: If the transport signals abort (ring stuck), fail the
      * entire encode. A missing chunk corrupts the PNG — abort is the only
      * safe option (John 2026-10-08). */
-    if (!snaptest_chunk_cb_(ctx->id, ctx->mid, ctx->seq, -1, ctx->b64_tmp)) {
+    if (!snaptest_chunk_cb_(ctx->id, ctx->mid, ctx->seq, -1, ctx->b64_tmp,
+                            eyes_crc32_(data, len))) {
         ctx->failed = true;
         return false;
     }

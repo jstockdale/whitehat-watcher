@@ -83,9 +83,9 @@ an offline Tier-0 root, a Tier-1 provisioning tier, and device-pinned
 commander keys whose *scopes* are enforced on-device at verify time (a
 least-privilege key physically cannot flash firmware or change
 permissions). Provisioning and recovery happen over serial only:
-physical access is root. In bridged mode the console page verifies
-seals today; the end state adds device-side re-verification so the page
-is never trusted. Full design: `host-agent/mqtt-bridge/MQTT_SEAL_ARCHITECTURE.md`.
+physical access is root. The device verifies every command's seal
+itself — in bridged mode the console page is a relay, never a trust
+anchor. Full design: `host-agent/mqtt-bridge/MQTT_SEAL_ARCHITECTURE.md`.
 
 ## The Himax firmware
 
@@ -232,6 +232,38 @@ chain, and mode/touch/wheel/wake-word input components. Highlights:
 - Delivery of new S3 firmware is itself a sealed, human-gated flow:
   chunks go over MQTT to the console page, the page verifies the hash,
   and a person clicks "flash".
+- **Ack'd chunk streaming** (0.4.35+): image chunks can be gated on
+  host acknowledgements — per-chunk CRC32, nack-triggered resend,
+  baud-aware timeouts — so a transfer degrades loudly instead of
+  shipping a hole.
+- **Negotiated serial baud** (landed): the console link boots at
+  115200 always, then negotiates up with round-trip confirmation and
+  automatic fallback. The CH9102 bridge tops out at a measured,
+  reproduced **750000** baud (107/107 clean); 921600 garbles from
+  bridge-chip phase hunting, and 576000/691200/806400 are host-side
+  dead zones. Design: `docs/baud-negotiation-design-2026-11-03.md`.
+- **Voice, end to end** (0.4.37–0.4.45): on-device wake word
+  ("Hi/Hey, Muse" — `wn10_himuse`, a WakeNet10 model Espressif
+  trained and published after this project's feature request,
+  esp-sr#88) plus push-to-talk, both feeding sealed audio takes to
+  the host for transcription. Wake-word takes stop on a *dynamic*
+  silence detector: thresholds derive from a rolling ambient-RMS
+  measurement taken live in the room, never a fixed constant, with a
+  4 s trailing-silence stop. Getting here required finding why the
+  microphone had been silent since the project began: its supply
+  rail is the ES8311 codec's reference output, which no firmware —
+  stock-derived code included — ever switched on. The full audit is
+  `docs/mic-audit-2026-11-07.md`; the fix (0.4.43) powers the codec
+  at PTT init and never closes it.
+- **On-device replies** (0.4.45+): a sealed `reply` command renders
+  the host agent's answer on the Watcher's screen as a paced text
+  reveal (~18 chars/s), so the device can answer back in the room,
+  not just in a chat window. The message view's margins were set by
+  measurement, not assumption: a ring diagnostic (0.4.46) drew
+  concentric circles on the round panel, the operator read off the
+  largest fully-visible one, and the text block was inscribed in
+  that circle (0.4.47). Wheel scrolls the text; the reveal
+  auto-scrolls to follow; the dwell is 15 s (0.4.48).
 
 ## Repo layout
 
@@ -244,7 +276,14 @@ chain, and mode/touch/wheel/wake-word input components. Highlights:
 | `docs/` | Design records and investigations — start with `docs/RUNBOOK.md` (system operations), then the deep-dives below |
 | `tools/pki/` | PKI provisioning tooling for the seal trust chain |
 | `cursor-model/`, `wakeword-training/` | On-device model work: cursor detection for the Himax NPU, wake-word training |
-| `vendor/` | Read-only upstream reference trees (schematics, official firmware/BSP) — never built from directly |
+| `vendor/` | Read-only upstream reference trees (schematics, official firmware/BSP) — never built from directly; **kept locally, not tracked in this repo** |
+
+Bench-runtime data — camera snapshots, audio captures, transfer
+chunks, logs — is likewise local working state under
+`host-agent/mqtt-bridge/` and not part of the published tree.
+Project policy: **bench captures (screen snapshots and voice
+recordings) are never published** — they are working data from a
+person's home and desk, not project artifacts.
 
 Deep-dives worth reading:
 `docs/spi-subsystem-research-2026-10-09.md` (the SPI link, including the
@@ -252,32 +291,45 @@ measured re-baseline that overturned its own earlier theory),
 `docs/a0-rearm-investigation-prep-2026-11-02.md` (the re-arm fix, phase
 by phase), `docs/chunk-loss-rca-2026-11-02.md`,
 `docs/bridge-reassembler-design-2026-11-02.md`,
-`docs/sd-capture-audit-design-2026-11-02.md`, and
-`docs/baud-negotiation-design-2026-11-03.md`.
+`docs/sd-capture-audit-design-2026-11-02.md`,
+`docs/baud-negotiation-design-2026-11-03.md`, and
+`docs/mic-audit-2026-11-07.md` (how a microphone stays silent for two
+months with every digital register correct).
 
 ## Status
 
-**Working and bench-validated** (S3 firmware 0.4.23 + Himax firmware
-0.4.20.60): BLE HID input; eyes-on-screen capture with byte-exact frame
-delivery; the SPI bulk path at ~4 s (from 35.7 s) with zero CRC failures;
-sealed command control in bridged mode; the console + bridge toolchain.
-Still on the list: the formal 20-frame soak for the SPI work (validation
-so far: 160 link tests, 923+ bulk commands, multiple full frames).
+**Working and bench-validated** (S3 firmware 0.4.48 + Himax firmware
+0.4.20.60, console 0.4.188): BLE HID input; eyes-on-screen capture
+with byte-exact frame delivery; the SPI bulk path at ~4 s (from
+35.7 s) with zero CRC failures; sealed command control with
+device-side verification; negotiated serial baud (750000 top rung);
+ack'd chunk streaming; and the **complete voice loop** — wake word
+or push-to-talk in, transcription on the host, the answer rendered
+back on the device's screen. The console + bridge toolchain is the
+daily driver for all of it. Still on the list: the formal 20-frame
+soak for the SPI work (validation so far: 160 link tests, 923+ bulk
+commands, multiple full frames).
+
+**Known issue:** an interrupt-watchdog panic in the legacy I2C ISR
+path has been seen twice (2026-11-07, 2026-11-08), each time with
+clean recovery; root cause not yet established. Investigation prep:
+`docs/i2c-isr-wdt-investigation-prep-2026-11-08.md`. (The watchdogs
+stay enabled — a watchdog firing on a hang is correct behavior.)
 
 **Next, in order:**
 
-1. **Switchable serial baud for tethered mode** (designed): boot at
-   115200 always, then negotiate up a ladder — 230400 / 460800 /
-   921600 — with a sealed command, an ack-at-the-old-rate switch, and a
-   5-second device-side auto-revert watchdog so a bad switch can never
-   strand the link. A console setting picks the preferred rung. This
-   takes the tethered frame phase from ~150 s of wire time to ~19 s at
-   the top rung.
-2. **Native Wi-Fi MQTT (Track B)**: the device on the broker directly.
-   First the mirror-queue fix (bounded-blocking enqueue + drop counter)
-   so image bytes can never be silently dropped, then chunks bypass the
-   serial ring entirely when native is up.
-3. **SD capture audit log** (designed): every capture — PNG and trigger
+1. **Streaming audio shipping**: today a take is captured in full,
+   then sent — with no flow control, so chunks can be lost in
+   transit. The rework puts a PSRAM ring buffer between capture and
+   a dedicated sender task so sends overlap capture instead of
+   following it. (Extending the image path's ack gate to audio is
+   the follow-on candidate.)
+2. **Native Wi-Fi MQTT (Track B)**: the device on the broker
+   directly, alongside — not instead of — the tethered mode. First
+   the mirror-queue fix (bounded-blocking enqueue + drop counter)
+   so image bytes can never be silently dropped, then chunks bypass
+   the serial ring entirely when native is up.
+3. **SD capture audit log** (designed): every capture — PNG and
    audio — also lands on the device's SD card with an append-only
    index, as the device-side source of truth behind the console's
    privacy log. A full card stops auditing and says so; it never

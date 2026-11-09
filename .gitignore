@@ -35,3 +35,18 @@ __pycache__/
 
 # Vendor secure-boot sample keys: on disk for the Himax image tool only, never in git
 **/secureboot_tool/cert/key/
+
+# Bench runtime state (2026-11-09): local working data, never published
+vendor/
+evidence/
+host-agent/mqtt-bridge/chunks/
+host-agent/mqtt-bridge/.watchdog.lock
+host-agent/mqtt-bridge/*.acl.bak-*
+sub_off*.txt
+tele_off*.txt
+visual_grounding_check.html
+
+# Bench captures: NEVER published (John, 2026-11-09) — screen snapshots
+# and voice recordings are private working data, not project artifacts.
+host-agent/mqtt-bridge/snapshots/
+host-agent/mqtt-bridge/audio-captures/

@@ -45,6 +45,16 @@ void ptt_stop_external(void);
 /** True while an external (wake-word triggered) recording is active. */
 bool ptt_is_external(void);
 
+/* Shared mic access (v0.4.36): ptt owns the ES7243E + I2S0. The
+ * wake-word component borrows the configured mic through these:
+ * acquire opens the codec (RIGHT channel, 27 dB gain), read returns
+ * clean mono samples via esp_codec_dev_read, release frees I2S0.
+ * Only one borrower at a time; the PTT/wake-word stop/start
+ * choreography arbitrates. */
+esp_err_t ptt_mic_acquire(void);
+void ptt_mic_release(void);
+int ptt_mic_read(void *data, int len);
+
 #ifdef __cplusplus
 }
 #endif

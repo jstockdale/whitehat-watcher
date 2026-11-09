@@ -29,10 +29,15 @@
 #include "esp_system.h"
 #include "esp_heap_caps.h"
 #include "driver/i2c.h"
+#include "driver/uart.h"
+#include "driver/gpio.h" /* v0.4.31: TX pad drive-strength experiment */
+#include "hal/uart_ll.h" /* v0.4.26: uart_ll_is_tx_idle (driverless TX drain) */
+#include "hal/uart_hal.h" /* v0.4.27 diag: uart_hal_get_sclk */
 #include "cJSON.h"
 #include "link.h"
 #include "hid_ble.h"
 #include "eyes.h"
+#include "wakeword.h"
 #include "net.h"
 /* Phase 2/3 seal: device-side verify, native MQTT, WIA1 sessions. */
 #include "seal_dev.h"
@@ -166,6 +171,139 @@ static volatile uint64_t log_written_ = 0;  /* total bytes ever written to ring 
 static volatile uint64_t tx_read_ = 0;      /* total bytes ever drained by TX task */
 static uint32_t log_dropped_ = 0;  /* bytes dropped due to writer lapping TX */
 static uint32_t log_laps_ = 0;     /* v0.4.21: TX-reader lap (resync) events */
+
+/* v0.4.24: switchable console baud (docs/baud-negotiation-design-2026-11-03.md).
+ * Boots at 115200 ALWAYS (known connect speed); a sealed {"t":"baud"} command
+ * negotiates up the ladder 230400/460800/921600. After a switch, the revert
+ * watchdog is armed: if no valid line arrives within 5 s, the monitor task
+ * falls back to 115200 so a bad switch can never strand the link. */
+#define LINK_BAUD_DEFAULT 115200
+static volatile uint32_t link_baud_ = LINK_BAUD_DEFAULT;
+/* v0.4.25: baud transitions strand junk in the RX path — bytes clocked
+ * in mid-switch (framing errors, port open/close transients) sit in the
+ * line assembly with no newline and poison the next host line (a valid
+ * resync ping was answered "unparseable line" in 0.4.24 field testing).
+ * The baud handler and the revert path request a flush here; rx_task
+ * performs it (it owns the ring and the drain) at the top of its loop. */
+static volatile bool rx_flush_requested_ = false;
+static void link_rx_flush(void) { rx_flush_requested_ = true; }
+/* v0.4.27 DIAGNOSTIC (921600 garbling investigation): log the UART0
+ * clock source, its frequency, and the raw CLKDIV after boot and after
+ * every switch, so the ACHIEVED baud is arithmetic, not opinion. If the
+ * mux sits on REF_TICK (1 MHz), the 1/16-step divider gives 941176 at
+ * the 921600 rung (+2.12% — over the framing edge) while 115200 stays
+ * at -0.08% — matching the observed error gradient across rungs. */
+static void baud_diag_log(const char *when, uint32_t target)
+{
+    uart_hal_context_t hal = { .dev = &UART0 };
+    soc_module_clk_t src = 0;
+    uart_hal_get_sclk(&hal, &src);
+    uint32_t freq = 0;
+    (void)uart_get_sclk_freq((uart_sclk_t)src, &freq);
+    uint32_t div_int = UART0.clkdiv.clkdiv;
+    uint32_t div_frag = UART0.clkdiv.clkdiv_frag;
+    /* v0.4.34: integer math, same reasoning as baud_actual_now. */
+    uint32_t tot16 = div_int * 16u + div_frag;
+    uint32_t actual = (freq && tot16)
+                          ? (uint32_t)(((uint64_t)freq * 16u) / tot16)
+                          : 0;
+    ESP_LOGI(TAG, "baud diag %s: target=%u sclk=%d freq=%u clkdiv=%u+%u/16 actual=%u",
+             when, (unsigned)target, (int)src, (unsigned)freq,
+             (unsigned)div_int, (unsigned)div_frag, (unsigned)actual);
+}
+/* v0.4.35: ack'd chunk streaming state (see link.h). Written by the
+ * rx task (ack/nack lines are consumed in the line parser, like
+ * baud_ok), polled by the chunk sender in main.c. */
+static volatile int chunk_ack_id_ = -1;      /* armed stream id, -1 = off */
+static volatile int chunk_ack_last_ = -1;    /* highest acked seq */
+static volatile int chunk_nack_seq_ = -1;    /* latest nacked seq */
+static volatile uint32_t chunk_nack_count_ = 0;
+static volatile uint32_t chunk_nack_seen_ = 0;
+
+void link_chunk_ack_arm(int id)
+{
+    chunk_ack_id_ = id;
+    chunk_ack_last_ = -1;
+    chunk_nack_seq_ = -1;
+    chunk_nack_count_ = 0;
+    chunk_nack_seen_ = 0;
+}
+
+void link_chunk_ack_disarm(void)
+{
+    chunk_ack_id_ = -1;
+}
+
+bool link_chunk_ack_active(void)
+{
+    return chunk_ack_id_ >= 0;
+}
+
+void link_chunk_ack_note_send(void)
+{
+    chunk_nack_seen_ = chunk_nack_count_;
+}
+
+bool link_chunk_ack_wait(int id, int seq, size_t chunk_chars)
+{
+    if (chunk_ack_id_ != id) {
+        return true; /* not armed for this stream: do not gate */
+    }
+    /* Baud-aware timeout (see link.h): wire time + slack, 1 s floor. */
+    uint32_t timeout_ms = 600 + (uint32_t)((chunk_chars * 10000ULL) /
+                                           (link_baud_ ? link_baud_ : 115200));
+    if (timeout_ms < 1000) {
+        timeout_ms = 1000;
+    }
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    for (;;) {
+        if (chunk_ack_last_ >= seq) {
+            return true;
+        }
+        if (chunk_ack_id_ != id) {
+            return true; /* disarmed mid-wait: lift the gate */
+        }
+        if (chunk_nack_count_ != chunk_nack_seen_ &&
+            chunk_nack_seq_ == seq) {
+            return false; /* host has it but it failed validation */
+        }
+        if (esp_timer_get_time() >= deadline) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+static volatile int64_t baud_revert_deadline_us_ = 0; /* 0 = disarmed */
+/* v0.4.28: revert to the last CONFIRMED rate, not always 115200
+ * (John's ladder: a failed 921600 should fall back to the proven
+ * 460800). rx_task records the current rate here whenever a valid
+ * line disarms the watchdog — that rate has demonstrably carried
+ * traffic. The monitor reverts to it first; if it stays silent too,
+ * a second stage falls to 115200. Stage2 flag marks that second leg. */
+static volatile uint32_t baud_last_good_ = LINK_BAUD_DEFAULT;
+static volatile bool baud_revert_stage2_ = false;
+/* v0.4.28: RX FIFO overflow events (polled from the UART raw
+ * interrupt status by rx_task) — the page→device loss counter this
+ * link has never had. The 128-byte FIFO fills in ~1.4 ms at 921600,
+ * so any rx_task stall (PSRAM cache-off windows, scheduling) shows
+ * up here. Reported in the heartbeat. */
+static volatile uint32_t rx_ovf_ = 0;
+static uint32_t baud_actual_now(void)
+{
+    uart_hal_context_t hal = { .dev = &UART0 };
+    soc_module_clk_t src = 0;
+    uart_hal_get_sclk(&hal, &src);
+    uint32_t freq = 0;
+    (void)uart_get_sclk_freq((uart_sclk_t)src, &freq);
+    /* v0.4.34: integer math (was soft-emulated doubles -- this
+     * runs in baud log paths, incl. the small-stack monitor). */
+    uint32_t tot16 = (uint32_t)UART0.clkdiv.clkdiv * 16u +
+                     (uint32_t)UART0.clkdiv.clkdiv_frag;
+    return (freq && tot16)
+               ? (uint32_t)(((uint64_t)freq * 16u) / tot16)
+               : 0;
+}
 static SemaphoreHandle_t log_lock_ = NULL;
 static vprintf_like_t log_orig_vprintf_ = NULL;
 /* v0.4.18.70 (Claude F6a): Deleted dead log_ring_write (no callers, old blocking semantics). */
@@ -280,10 +418,19 @@ bool link_wait_for_ring_space(uint32_t timeout_ms, size_t required_bytes)
         if (waited >= timeout_ms) {
             return false;
         }
-        /* 50ms delay: gives TX task time to drain ~500 bytes at 115200.
-         * Longer than the 20ms in 0.4.18.81 to reduce CPU spin. */
-        vTaskDelay(pdMS_TO_TICKS(50));
-        waited += 50;
+        /* Poll delay sized to drain ~500 bytes at the CURRENT baud
+         * (v0.4.24: baud-derived — ~43ms at 115200, ~5ms at 921600),
+         * clamped to [5, 50] ms. Longer than the 20ms in 0.4.18.81 to
+         * reduce CPU spin. */
+        uint32_t drain_ms = 5000000u / link_baud_;
+        if (drain_ms < 5) {
+            drain_ms = 5;
+        }
+        if (drain_ms > 50) {
+            drain_ms = 50;
+        }
+        vTaskDelay(pdMS_TO_TICKS(drain_ms));
+        waited += drain_ms;
     }
     return true;
 }
@@ -747,6 +894,12 @@ static void link_heartbeat_task(void *arg)
             cJSON_AddNumberToObject(o, "uptime_s",
                 (double)(esp_timer_get_time() / 1000000));
             cJSON_AddStringToObject(o, "fw", fw_version_);
+            cJSON_AddNumberToObject(o, "baud", (double)link_baud_);
+            /* v0.4.28: achieved baud from the live CLKDIV + RX FIFO
+             * overflow count — the UART path's vital signs. */
+            cJSON_AddNumberToObject(o, "baud_actual",
+                (double)baud_actual_now());
+            cJSON_AddNumberToObject(o, "rx_ovf", (double)rx_ovf_);
             cJSON_AddNumberToObject(o, "heap_free",
                 heap_caps_get_free_size(MALLOC_CAP_8BIT));
             cJSON_AddNumberToObject(o, "internal_free",
@@ -835,6 +988,35 @@ static void link_monitor_task(void *arg)
     (void)arg;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(LINK_MONITOR_PERIOD_MS));
+        /* v0.4.24 baud auto-revert (armed by the "baud" handler). */
+        if (baud_revert_deadline_us_ &&
+            esp_timer_get_time() > baud_revert_deadline_us_) {
+            /* v0.4.28: two-stage fallback — last confirmed rate first,
+             * 115200 only if that stays silent too. */
+            uint32_t was = link_baud_;
+            uint32_t target;
+            if (baud_revert_stage2_) {
+                target = LINK_BAUD_DEFAULT;
+                baud_revert_stage2_ = false;
+                baud_revert_deadline_us_ = 0;
+            } else if (baud_last_good_ != LINK_BAUD_DEFAULT &&
+                       baud_last_good_ != was) {
+                target = baud_last_good_;
+                baud_revert_stage2_ = true;
+                baud_revert_deadline_us_ = esp_timer_get_time() + 8000000;
+            } else {
+                target = LINK_BAUD_DEFAULT;
+                baud_revert_deadline_us_ = 0;
+            }
+            if (uart_set_baudrate(UART_NUM_0, target) == ESP_OK) {
+                link_baud_ = target;
+                link_rx_flush(); /* v0.4.25: drop transition junk */
+            }
+            ESP_LOGW(TAG, "baud: no valid traffic at %u — reverted to %u%s",
+                     (unsigned)was, (unsigned)target,
+                     baud_revert_stage2_ ? " (last confirmed)" : "");
+            baud_diag_log("revert", target);
+        }
         if (!pending_lock_) {
             continue;
         }
@@ -1286,6 +1468,120 @@ static void handle_command(cJSON *cmd)
         link_send_term(o);
         return;
     }
+    if (strcmp(t, "baud") == 0) {
+        /* v0.4.24: negotiate the console UART rate (see the design note).
+         * Ack FIRST at the current baud, let it physically drain, then
+         * switch and arm the revert watchdog; the host confirms the
+         * ROUND TRIP by sending {"t":"baud_ok"} once it has parsed a
+         * reply at the new rate (v0.4.30 — rx_task disarms on that
+         * line only). */
+        int rate = opt_int(cmd, "rate", 0);
+        /* v0.4.32: mid-ladder candidates added for the rate scan --
+         * 460800 is proven clean and 921600 is beyond this link's
+         * edge quality at every divider offset (host sweep, 2026-
+         * 11-04); find the highest clean rung instead. S3 clkdiv
+         * quantization at these rates is <0.05%. */
+        if (rate != 115200 && rate != 230400 && rate != 460800 &&
+            rate != 576000 && rate != 691200 && rate != 750000 &&
+            rate != 806400 && rate != 921600) {
+            link_respond_err(t, "unsupported rate");
+            return;
+        }
+        /* v0.4.33: optional clkdiv trim, in 1/16-divider steps
+         * (positive = larger divider = slower). Clamped to a sane
+         * bench range; applied after the switch below. */
+        int frag = opt_int(cmd, "frag", 0);
+        if (frag < -24) frag = -24;
+        if (frag > 24) frag = 24;
+        cJSON *o = link_new_event("baud_ack");
+        if (o) {
+            cJSON_AddNumberToObject(o, "rate", rate);
+            cJSON_AddNumberToObject(o, "from", (double)link_baud_);
+            cJSON_AddNumberToObject(o, "frag", frag);
+            if (cmd_mid_[0]) {
+                cJSON_AddStringToObject(o, "_mid", cmd_mid_);
+            }
+            link_send_term(o);
+        }
+        /* v0.4.26: wait until the ack is really ON THE WIRE before
+         * switching. The old uart_wait_tx_done call never waited at
+         * all: it is a driver-object API and the console runs
+         * driverless through the VFS (p_uart_obj[0] is NULL), so it
+         * failed instantly with "uart driver error". And even a
+         * working FIFO wait would miss the real backlog — the ack
+         * queues in the shared log ring behind whatever console_tx
+         * hasn't drained. Sample the monotonic written-counter (the
+         * ack enqueue above already advanced it past the ack) and
+         * wait for the drained-counter to cover it, then for the TX
+         * FSM to go idle (last byte actually on the wire). */
+        {
+            uint64_t ack_end = log_written_;
+            int64_t wait_start = esp_timer_get_time();
+            while (tx_read_ < ack_end &&
+                   esp_timer_get_time() - wait_start < 2000000) {
+                vTaskDelay(pdMS_TO_TICKS(2));
+            }
+            if (tx_read_ < ack_end) {
+                ESP_LOGW(TAG,
+                         "baud: ring still draining after 2s — switching anyway");
+            }
+            wait_start = esp_timer_get_time();
+            while (!uart_ll_is_tx_idle(&UART0) &&
+                   esp_timer_get_time() - wait_start < 200000) {
+                vTaskDelay(1);
+            }
+        }
+        if (uart_set_baudrate(UART_NUM_0, (uint32_t)rate) == ESP_OK) {
+            link_baud_ = (uint32_t)rate;
+            /* v0.4.33: apply the clkdiv trim. The 2026-11-04
+             * forensics show the CH9102 receiver losing bit-phase
+             * coherence across a burst at 921600 (clean edges,
+             * corruption growing mid-line, displaced-regrouping
+             * reproduces the captured garbage) -- a sampling-rate
+             * mismatch. Trimming from THIS side is exact (1/16
+             * steps, readback via baud_actual_now) while the host
+             * sweep through the bridge's own divider mapping was
+             * erratic. The revert path calls plain
+             * uart_set_baudrate, restoring the nominal divider,
+             * so a bad trim can never stick. */
+            if (frag != 0) {
+                uint32_t tot16 = (uint32_t)UART0.clkdiv.clkdiv * 16u
+                               + (uint32_t)UART0.clkdiv.clkdiv_frag;
+                int32_t nt = (int32_t)tot16 + frag;
+                if (nt < 16 * 8) nt = 16 * 8;
+                UART0.clkdiv.clkdiv = (uint32_t)nt / 16u;
+                UART0.clkdiv.clkdiv_frag = (uint32_t)nt % 16u;
+            }
+            link_rx_flush(); /* v0.4.25: drop transition junk */
+            /* v0.4.30: the armed window is 8 s (was 5): the host's
+             * slowest success path (lost ack → probe at the new rate
+             * → baud_ok) can take ~4.5 s; margin matters more than
+             * revert speed now that the disarm is round-trip-proof. */
+            baud_revert_deadline_us_ =
+                (rate == LINK_BAUD_DEFAULT)
+                    ? 0
+                    : esp_timer_get_time() + 8000000;
+            baud_revert_stage2_ = false; /* v0.4.28: fresh attempt */
+            ESP_LOGI(TAG, "baud: switched to %d (revert %s)", rate,
+                     rate == LINK_BAUD_DEFAULT ? "disarmed" : "armed 8s");
+            baud_diag_log("switch", (uint32_t)rate);
+            /* v0.4.33: announce the achieved rate at the NEW rate;
+             * the host's trim sweep reads its ground truth here. */
+            {
+                cJSON *rdy = link_new_event("baud_ready");
+                if (rdy) {
+                    cJSON_AddNumberToObject(rdy, "rate", rate);
+                    cJSON_AddNumberToObject(rdy, "frag", frag);
+                    cJSON_AddNumberToObject(rdy, "actual",
+                                            (double)baud_actual_now());
+                    link_send_term(rdy);
+                }
+            }
+        } else {
+            ESP_LOGE(TAG, "baud: uart_set_baudrate(%d) failed", rate);
+        }
+        return;
+    }
     if (strcmp(t, "type") == 0) {
         const char *text = opt_str(cmd, "text");
         if (!text) {
@@ -1293,6 +1589,22 @@ static void handle_command(cJSON *cmd)
             return;
         }
         link_respond_hid(t, hid_ble_type_text(text));
+        return;
+    }
+    if (strcmp(t, "reply") == 0) {
+        /* {"t":"reply","text":"..."} — the host's short reply to a
+         * voice take (v0.4.45): end the AI-thinking LED and show the
+         * text on the device screen, paced at reading speed by the
+         * display component. The full reply lives in the chat; this
+         * is the glanceable essence. */
+        const char *text = opt_str(cmd, "text");
+        if (!text || !*text) {
+            link_respond_err(t, "missing text");
+            return;
+        }
+        link_ai_thinking_stop();
+        display_show_message(text);
+        link_respond_ok(t);
         return;
     }
     if (strcmp(t, "key") == 0) {
@@ -1612,7 +1924,15 @@ static void handle_command(cJSON *cmd)
              * (base64). Read op — safe over MQTT, not serial-gated. Runs
              * synchronously; the terminal {t:"dbg",cmd:"png"} reply lands
              * after the last chunk. */
+            /* v0.4.35: same ack opt-in as snaptest; the capture is
+             * synchronous here, so disarm right after it returns. */
+            if (opt_int(cmd, "ack", 0) != 0) {
+                link_chunk_ack_arm(LINK_PNG_STREAM_ID);
+            } else {
+                link_chunk_ack_disarm();
+            }
             esp_err_t err = eyes_capture_png();
+            link_chunk_ack_disarm();
             cJSON *o = dbg_new("png");
             cJSON_AddBoolToObject(o, "ok", err == ESP_OK);
             if (err != ESP_OK) {
@@ -1638,6 +1958,17 @@ static void handle_command(cJSON *cmd)
             cJSON_AddItemToObject(o, "tasks", tasks);
             cJSON_AddNumberToObject(o, "dropped_logs", (double)log_dropped_);
             link_send(o);
+            return;
+        }
+        if (strcmp(sub, "rings") == 0) {
+            /* Visible-area diagnostic (v0.4.46): concentric rings.
+             * Toggle — show if hidden, hide if showing. */
+            if (display_ring_test_visible()) {
+                display_hide_ring_test();
+            } else {
+                display_show_ring_test();
+            }
+            link_respond_ok(t);
             return;
         }
         if (strcmp(sub, "spitest") == 0) {
@@ -2033,6 +2364,79 @@ static void handle_command(cJSON *cmd)
             link_respond_ok(t);
             return;
         }
+        if (strcmp(sub, "wakeword") == 0) {
+            /* {"t":"dbg","cmd":"wakeword","on":1|0} — enable/disable
+             * wake-word listening (persisted in NVS). No "on" field =
+             * status only. v0.4.36: this subcommand was documented in
+             * the wakeword DESIGN.md since v0.3.4 but never wired into
+             * the dispatch — the feature could not be turned on at all.
+             * The live model is "Hi, ESP" (wn9_hiesp); the phrase field
+             * reports the NVS selection, which falls back to it. */
+            if (cJSON_HasObjectItem(cmd, "on")) {
+                wakeword_set_enabled(opt_int(cmd, "on", 1) != 0);
+            }
+            cJSON *o = dbg_new(sub);
+            cJSON_AddBoolToObject(o, "enabled", wakeword_enabled());
+            cJSON_AddBoolToObject(o, "listening", wakeword_listening());
+            cJSON_AddNumberToObject(o, "phrase",
+                                    (double)wakeword_get_phrase());
+            cJSON_AddNumberToObject(o, "detections",
+                                    (double)wakeword_detection_count());
+            cJSON_AddStringToObject(o, "model", "wn10_himuse");
+            /* v0.4.38 mic instrumentation (extern, defined in ptt.c):
+             * cumulative codec read outcomes + peak since last reset,
+             * so capture health is queryable without the log stream. */
+            {
+                extern void ptt_mic_stats(uint32_t *, uint32_t *, int *,
+                                          int32_t *);
+                uint32_t ok, err;
+                int lr;
+                int32_t pk;
+                ptt_mic_stats(&ok, &err, &lr, &pk);
+                cJSON_AddNumberToObject(o, "mic_ok", (double)ok);
+                cJSON_AddNumberToObject(o, "mic_err", (double)err);
+                cJSON_AddNumberToObject(o, "mic_peak", (double)pk);
+            }
+            link_send(o);
+            return;
+        }
+        if (strcmp(sub, "codec") == 0) {
+            /* {"t":"dbg","cmd":"codec"} — v0.4.41 mic audit: live
+             * ES7243E register dump (read-only I2C). The host diffs
+             * "regs" against the intended state in
+             * docs/mic-audit-2026-11-07.md. "acquired" says whether
+             * the mic is currently open (wake-word listening or a
+             * take) — a dump taken while released shows the
+             * powered-down state instead. */
+            extern esp_err_t ptt_codec_dump(bool *, char *, size_t);
+            char regs[320];
+            bool acq = false;
+            esp_err_t r = ptt_codec_dump(&acq, regs, sizeof(regs));
+            cJSON *o = dbg_new(sub);
+            if (r == ESP_OK) {
+                cJSON_AddStringToObject(o, "regs", regs);
+                cJSON_AddBoolToObject(o, "acquired", acq);
+            } else {
+                cJSON_AddStringToObject(o, "error", esp_err_to_name(r));
+            }
+            link_send(o);
+            return;
+        }
+        if (strcmp(sub, "loopback") == 0) {
+            /* {"t":"dbg","cmd":"loopback"} — v0.4.42: phased ES8311
+             * loopback / mic-power test (see ptt_loopback_test).
+             * Blocks ~4 s in this task; results arrive as three
+             * {"t":"loopback","phase":0|1|2} events. The ack here is
+             * non-terminal. */
+            extern esp_err_t ptt_loopback_test(void);
+            esp_err_t r = ptt_loopback_test();
+            cJSON *o = dbg_new(sub);
+            cJSON_AddStringToObject(
+                o, "result",
+                (r == ESP_OK) ? "done" : esp_err_to_name(r));
+            link_send(o);
+            return;
+        }
         if (strcmp(sub, "snaptest") == 0) {
             /* Async snapshot self-test: analyze a frame on-device, no
              * Wi-Fi needed. Completion arrives later via the snaptest
@@ -2040,6 +2444,14 @@ static void handle_command(cJSON *cmd)
             int id = opt_int(cmd, "id", 0);
             bool send = opt_int(cmd, "send", 0) != 0;
             bool fresh = opt_int(cmd, "fresh", 1) != 0;
+            /* v0.4.35: ack'd chunk streaming is opt-in per command —
+             * a host that never acks must never stall the sender, so
+             * the gate arms only when the command asks for it. */
+            if (opt_int(cmd, "ack", 0) != 0) {
+                link_chunk_ack_arm(id);
+            } else {
+                link_chunk_ack_disarm();
+            }
             esp_err_t err = eyes_snap_test_async(id, send, fresh,
                                                  cmd_mid_[0] ? cmd_mid_ : NULL);
             if (err == ESP_OK) {
@@ -2234,6 +2646,33 @@ static void rx_task(void *arg)
     static char line[RX_LINE_MAX]; /* .bss, not task stack */
     ESP_LOGI(TAG, "link ready on USB-serial console");
     for (;;) {
+        /* v0.4.28: sample the sticky RX-FIFO-overflow flag (latches
+         * until cleared, so polling here misses nothing). */
+        if (UART0.int_raw.rxfifo_ovf_int_raw) {
+            UART0.int_clr.rxfifo_ovf_int_clr = 1;
+            rx_ovf_++;
+        }
+        if (rx_flush_requested_) {
+            /* Baud transition — drop everything received so far so
+             * junk can't poison the next line. rx_task owns the ring
+             * and the drain, so it does the reset itself.
+             * v0.4.26: the discard is driverless — uart_flush_input
+             * needs the driver object this console never installs (it
+             * failed with "uart driver error" and did nothing). Read
+             * and drop whatever the VFS has buffered (this task is
+             * the only stdin reader; the fd is already non-blocking),
+             * then drop the ring contents. */
+            rx_flush_requested_ = false;
+            static char scratch[128];
+            int guard = 64; /* ≤8 KB; the HW FIFO is 128 B — generous */
+            while (guard-- > 0) {
+                int n = read(STDIN_FILENO, scratch, sizeof(scratch));
+                if (n <= 0) {
+                    break;
+                }
+            }
+            rx_rd_ = rx_wr_;
+        }
         rx_drain();
         bool busy = false;
         int r;
@@ -2249,6 +2688,54 @@ static void rx_task(void *arg)
                 continue; /* blank line */
             }
             cJSON *cmd = cJSON_Parse(line);
+            if (cmd) {
+                /* v0.4.30: the ONLY line that disarms the revert
+                 * watchdog is {"t":"baud_ok"} — the host sends it
+                 * solely after it has parsed a reply at the new rate,
+                 * i.e. proof the ROUND TRIP works. v0.4.24–0.4.28
+                 * disarmed on ANY parseable line, but host→device is
+                 * the clean direction on this link: the device parsed
+                 * the confirm pings, disarmed, and stayed at 921600
+                 * while the host heard only scrambled pongs and fell
+                 * back — a permanent divergence (field, 2026-11-03).
+                 * baud_ok is consumed here and never queued; receiving
+                 * it also records the current rate as last-proven. */
+                const char *t0 = opt_str(cmd, "t");
+                if (t0 && strcmp(t0, "baud_ok") == 0) {
+                    baud_revert_deadline_us_ = 0;
+                    baud_last_good_ = link_baud_;
+                    baud_revert_stage2_ = false;
+                    cJSON_Delete(cmd);
+                    continue;
+                }
+                if (t0 && strcmp(t0, "chunk_ack") == 0) {
+                    /* v0.4.35: host validated chunk seq of the armed
+                     * stream. Consumed here (never queued) so an ack
+                     * can never be reordered behind worker jobs —
+                     * the same rule as baud_ok. */
+                    int aid = opt_int(cmd, "id", -1);
+                    int aseq = opt_int(cmd, "seq", -1);
+                    if (aid == chunk_ack_id_ && aseq > chunk_ack_last_) {
+                        chunk_ack_last_ = aseq;
+                    }
+                    cJSON_Delete(cmd);
+                    continue;
+                }
+                if (t0 && strcmp(t0, "chunk_nack") == 0) {
+                    /* v0.4.35: host received the chunk but it failed
+                     * validation — the sender resends it immediately
+                     * instead of waiting out the ack timeout. Draws
+                     * on the same bounded attempt budget. */
+                    int aid = opt_int(cmd, "id", -1);
+                    int aseq = opt_int(cmd, "seq", -1);
+                    if (aid == chunk_ack_id_ && aseq >= 0) {
+                        chunk_nack_seq_ = aseq;
+                        chunk_nack_count_++;
+                    }
+                    cJSON_Delete(cmd);
+                    continue;
+                }
+            }
             if (!cmd) {
                 /* Not JSON (e.g. pasted log line): say so instead of going
                  * silent, so the host can tell noise apart from drops. */
@@ -2272,17 +2759,35 @@ static void rx_task(void *arg)
             /* Ownership of cmd transferred to the worker task. */
         }
         if (!busy) {
-            /* Idle: brief nap. A burst is caught on the next loop with
-             * ~no added latency (the loop re-drains immediately while
-             * bytes keep arriving). At 115200 baud ~23 bytes arrive per
-             * 2ms — far below the UART driver's RX ring. */
-            vTaskDelay(pdMS_TO_TICKS(2));
+            /* Idle: brief nap, baud-aware (v0.4.24). A burst is caught on
+             * the next loop with ~no added latency (the loop re-drains
+             * immediately while bytes keep arriving). At 115200 baud ~23
+             * bytes arrive per 2ms — far below the UART driver's RX ring;
+             * at 921600 the same 2ms would admit ~184 bytes, so the top
+             * rungs nap only 1ms (~92 bytes). */
+            vTaskDelay(pdMS_TO_TICKS(link_baud_ >= 460800 ? 1 : 2));
         }
     }
 }
 
 esp_err_t link_init(void)
 {
+    baud_diag_log("boot", LINK_BAUD_DEFAULT);
+    /* v0.4.31 EXPERIMENT (single variable vs 0.4.30): raise the UART0
+     * TX pad (GPIO43, the S3's IOMUX default for U0TXD) drive strength
+     * to max. The 921600 failure is asymmetric: host→device arrives
+     * clean (pings and commands parse), device→host scrambles —
+     * consistent with the CH9102's receiver marginally sampling the
+     * S3's TX edges. Sharper TX edges are the one analog lever
+     * firmware has. A/B the device→page error rate against 0.4.30;
+     * revert if it doesn't move. */
+    {
+        gpio_drive_cap_t cap_before = GPIO_DRIVE_CAP_0;
+        (void)gpio_get_drive_capability(GPIO_NUM_43, &cap_before);
+        (void)gpio_set_drive_capability(GPIO_NUM_43, GPIO_DRIVE_CAP_3);
+        ESP_LOGI(TAG, "tx pad drive cap %d -> %d (GPIO43 experiment)",
+                 (int)cap_before, (int)GPIO_DRIVE_CAP_3);
+    }
     tx_lock_ = xSemaphoreCreateMutex();
     if (!tx_lock_) {
         return ESP_ERR_NO_MEM;
@@ -2341,7 +2846,16 @@ esp_err_t link_init(void)
     if (!rx_psram_) {
         return ESP_FAIL;
     }
-    mon_psram_ = task_psram_create(link_monitor_task, "link_mon", 2048,
+    /* v0.4.34: 2048 -> 4096. The 2048 stack overflowed on the
+     * baud-revert path (ESP_LOGW + baud_diag_log: two full
+     * esp_log traversals in the system's smallest task) --
+     * panic + RTC_SW_CPU_RST at every unrecovered negotiation
+     * since 0.4.24, proven by --watch-revert 2026-11-04 and a
+     * matching error line in telemetry from the 0.4.176
+     * "console freeze" incident. 4096 = parity with link_hb,
+     * which does strictly heavier cJSON/log work; the margin
+     * is verified via the heartbeat stack_hwm readout. */
+    mon_psram_ = task_psram_create(link_monitor_task, "link_mon", 4096,
                                    NULL, 3, tskNO_AFFINITY);
     if (!mon_psram_) {
         return ESP_FAIL;

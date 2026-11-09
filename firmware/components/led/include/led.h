@@ -20,6 +20,7 @@ extern "C" {
  *    dark   = idle, nothing to show */
 typedef enum {
     LED_STATE_ERROR,             // pulsing red — highest priority, always wins
+    LED_STATE_REC_ENDING,        // blinking red — mic hot, silence heard, take ending soon (v0.4.44)
     LED_STATE_RECORDING,         // steady red — mic is hot
     LED_STATE_STARTUP_ISSUE,     // pulsing yellow — boot problem, recoverable
     LED_STATE_BLE_ADVERTISING,   // blue blink (2/sec) — waiting to pair

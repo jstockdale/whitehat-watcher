@@ -28,7 +28,7 @@ import time
 
 import paho.mqtt.client as mqtt
 
-from audio_handler import handle_device_message
+from audio_handler import handle_device_message, reassembler as _audio_reassembler
 from snaptest_handler import handle_snaptest_message
 import topic_acl
 
@@ -301,6 +301,13 @@ def bridge_loop(client: mqtt.Client) -> None:
     the bridge hasn't published anything else (quiet periods)."""
     while True:
         time.sleep(10)
+        # Flush audio takes whose audio_end never arrived (partial WAV +
+        # transcript attempt) instead of parking them forever.
+        try:
+            for _wav in _audio_reassembler.sweep():
+                log_line(f"[audio] utterance saved (expired partial): {_wav}")
+        except Exception as _e:
+            log_line(f"[audio] sweep failed: {_e}")
         with _publish_lock:
             idle_for = time.time() - _last_publish_at
         if idle_for >= IDLE_CHECKIN_INTERVAL:

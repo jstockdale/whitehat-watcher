@@ -37,9 +37,17 @@ python3 -c "from bench_lock import acquire_bench; print('LOCK:', acquire_bench('
 # Check status: python3 bench_lock.py  (exit 1 = busy)
 # Force-clear stuck lock (holder hung but not dead): python3 bench_lock.py --clear
 
-# 3. Fresh seal_floor — all discrete commands must be sealed (John, 2026-10-01)
-FLOOR=$(grep -a "seal_floor" telemetry.log | tail -1 | grep -o "seal_floor.:[0-9]*" | grep -o "[0-9]*")
-python3 -c "from seal_client import resync_counter; print('resynced:', resync_counter($FLOOR))"
+# 3. Seal floor — AUTOMATED since 2026-11-09: seal_command() resyncs
+#    forward from the freshest telemetry floor before every seal
+#    (max over the log tail; the anti-oracle cap still applies, and a
+#    floor problem warns instead of blocking the send). This step is
+#    now just a sanity check; the manual resync below it is the
+#    fallback if the bridge has been down:
+python3 seal_client.py --auto-resync
+# Manual fallback: FLOOR=<floor from a fresh seal_status/ready line>
+# python3 -c "from seal_client import resync_counter; print('resynced:', resync_counter($FLOOR))"
+# (Do NOT take the floor from `grep | tail -1`: the page-side
+# seal_status can report 0 before loading its high-water.)
 
 # 4. Confirm versions on bench
 grep -a "fw=0.4" telemetry.log | tail -1          # S3 version
@@ -283,10 +291,15 @@ if acquire_bench('my-task-name') is None:
 
 John, 2026-10-01 (standing): the S3 executes control commands **iff sealed** under the PKI multi-tier trust chain (Tier 0 offline root → Tier 1 provisioning cert → device-pinned keys). **Sealed-only covers read commands too** — discrete reads (`dbg`, AT reads) must carry a valid seal. The continuous telemetry stream stays on BLAKE2b-MAC + XChaCha20-Poly1305 (per-packet signatures would be wasteful).
 
-**Before every send:**
-1. Read fresh `seal_floor`: `grep -a "seal_floor" telemetry.log | tail -1`
-2. Resync: `python3 -c "from seal_client import resync_counter; resync_counter(<floor>)"`
-3. `send_command.py` seals by default (`--no-seal` only for unkeyed/bootstrap).
+**Before every send:** nothing manual — since 2026-11-09
+`seal_client.seal_command()` auto-resyncs the counter forward from
+the freshest `seal_floor` in the bridge's telemetry log (which
+arrives over the MAC-authenticated telemetry channel) before
+sealing; `send_command.py` reports `[floor-synced A->B]` when it
+moved. The manual resync (`seal_client.py --resync <floor>`, or
+`--auto-resync` to run the same path verbosely) remains for
+forensics and bridge-down recovery. `send_command.py` seals by
+default (`--no-seal` only for unkeyed/bootstrap).
 
 Key material: commander `muse-01` keys at `~/.ssh/watcher_seal_*` (0600). Never request raw credentials; use the Secure Vault flow.
 

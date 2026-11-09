@@ -140,15 +140,21 @@ esp_err_t eyes_snap_test_async(int id, bool send, bool fresh, const char *mid);
 /** Chunked base64 streaming of the captured frame. seq runs 0..total-1.
  *  `mid` is the originating command's _mid for correlation.
  *  v0.4.18.84: Returns false to abort the transfer (e.g. transport stuck).
- *  A dropped chunk corrupts the PNG, so abort is the only safe option. */
+ *  A dropped chunk corrupts the PNG, so abort is the only safe option.
+ *  v0.4.35: `crc32` is the zlib CRC32 of the RAW chunk bytes (pre-base64),
+ *  forwarded into the chunk event so an ack-mode host can validate each
+ *  chunk before acknowledging it (see link_chunk_ack_* in link.h). */
 typedef bool (*eyes_snaptest_chunk_cb_t)(int id, const char *mid, int seq,
-                                         int total, const char *b64);
+                                         int total, const char *b64,
+                                         uint32_t crc32);
 void eyes_set_snaptest_chunk_cb(eyes_snaptest_chunk_cb_t cb);
 
 /** Chunked base64 streaming of a captured PNG (see eyes_capture_png).
  *  seq runs 0..total-1.
- *  v0.4.18.84: Returns false to abort (see above). */
-typedef bool (*eyes_png_chunk_cb_t)(int seq, int total, const char *b64);
+ *  v0.4.18.84: Returns false to abort (see above).
+ *  v0.4.35: `crc32` added, same contract as the snaptest chunk cb. */
+typedef bool (*eyes_png_chunk_cb_t)(int seq, int total, const char *b64,
+                                    uint32_t crc32);
 void eyes_set_png_chunk_cb(eyes_png_chunk_cb_t cb);
 
 /** Capture a full-resolution frame via AT+SPIDUMP + SPI bulk read,

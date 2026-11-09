@@ -32,11 +32,14 @@ CONFIG_FREERTOS_HZ=1000
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5744
 CONFIG_LWIP_TCP_WND_BUF_DEFAULT=5744
 
-# ESP-SR wake-word (v0.3.4): "Hi, ESP" (wn9_hiesp) as the working interim
-# model. "Hey Muse" / "Hey Watcher" need Espressif custom training
-# (see wakeword/DESIGN.md); the AFE supports 2 models, so they drop in
-# via wakenet_model_name_2 when available.
+# ESP-SR wake-word models: "Hi, ESP" (wn9_hiesp, the v0.3.4 interim)
+# plus "Hi/Hey, Muse" (wn10_himuse) — trained by Espressif per John's
+# 2026-09-24 request on esp-sr#88 (answered 2026-10-30) and vendored
+# into the esp-sr component's wakenet_model dir for fw 0.4.37 (our
+# locked esp-sr predates its publication). The AFE runs both: himuse
+# is the primary, hiesp the second model in BOTH phrase mode.
 CONFIG_SR_WN_WN9_HIESP=y
+CONFIG_SR_WN_WN10_HIMUSE=y
 
 # LVGL 8 for the SPD2010 status screen (RGB565 panel on QSPI)
 CONFIG_LV_COLOR_16_SWAP=y

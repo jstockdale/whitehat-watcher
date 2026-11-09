@@ -1,13 +1,21 @@
 /* Wake-word detection via ESP-SR (v0.3.4).
  *
- * Architecture: the wake-word component owns I2S0 while listening.
- * PTT takes I2S0 via wakeword_stop() before recording, returns it via
- * wakeword_start() after. Only one owner at a time — no conflicts.
+ * Architecture: the mic (ES7243E + I2S0) is owned by the ptt
+ * component; wakeword borrows it via ptt_mic_acquire/release/read
+ * (extern, the house pattern — no component cycle). v0.4.36: this
+ * matters because the codec's ADC is only configured inside
+ * esp_codec_dev_open — the old design ran a private raw I2S channel
+ * against an unconfigured chip. PTT takes the mic back via
+ * wakeword_stop() before recording, returns it via wakeword_start()
+ * after. Only one borrower at a time — no conflicts.
  *
- * Current model: "Hi, ESP" (wn9_hiesp) — working interim. "Hey Muse" and
- * "Hey Watcher" need Espressif custom training (see DESIGN.md). The AFE
- * supports 2 simultaneous models; they drop into wakenet_model_name_2
- * when trained. NVS `wakeword_phrase` selects the active phrase set.
+ * Models: "Hi/Hey, Muse" (wn10_himuse — trained by Espressif per
+ * John's 2026-09-24 request on esp-sr#88, answered 2026-10-30, in the
+ * firmware since 0.4.37) and "Hi, ESP" (wn9_hiesp, the interim). The
+ * AFE supports 2 simultaneous models: BOTH mode runs himuse as the
+ * primary and hiesp as wakenet_model_name_2. "Hey Watcher" was never
+ * trained; its selection falls back to himuse with a warning. NVS
+ * `wakeword_phrase` selects the active phrase set.
  *
  * Default: OFF (opt-in). Enable via {"t":"dbg","cmd":"wakeword","on":1}.
  */
@@ -16,12 +24,13 @@
 #include "task_psram.h"
 
 #include <string.h>
+#include <math.h>
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/i2s_std.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -32,24 +41,18 @@
 
 static const char *TAG = "wakeword";
 
-/* ---- I2S config (same mic as PTT: ES7243 on I2S0) ---- */
+/* ---- mic (owned by ptt, borrowed via ptt_mic_*) ---- */
 #define WW_SAMPLE_RATE   16000
-#define WW_I2S_PORT      I2S_NUM_0
-#define WW_PIN_MCLK      GPIO_NUM_10
-#define WW_PIN_BCLK      GPIO_NUM_11
-#define WW_PIN_WS        GPIO_NUM_12
-#define WW_PIN_DIN       GPIO_NUM_15
 
 /* ---- NVS ---- */
 #define NVS_NS            "watcher"
 #define NVS_KEY_ENABLED   "wakeword_en"
 #define NVS_KEY_PHRASE    "wakeword_phrase"
 
-/* Interim model: "Hi, ESP". Shipped via the "model" partition
- * (CONFIG_SR_WN_WN9_HIESP). */
+/* Models shipped via the "model" partition (CONFIG_SR_WN_*). */
 #define WW_MODEL_HIESP    "wn9_hiesp"
-/* Placeholders for Espressif-trained models (not yet available). */
-#define WW_MODEL_HEY_MUSE    "wn9_hey_muse"
+#define WW_MODEL_HEY_MUSE    "wn10_himuse"
+/* No "Hey Watcher" model exists; the name stays for the fallback log. */
 #define WW_MODEL_HEY_WATCHER "wn9_hey_watcher"
 
 /* ---- state ---- */
@@ -58,13 +61,34 @@ static bool enabled_ = false;
 static bool suspended_ = false;
 static wakeword_cb_t cb_ = NULL;
 static uint32_t detections_ = 0;
+
+/* v0.4.44: dynamic level tracking for the triggered take's silence
+ * stop. The feed meters every 1024-sample read: a noise-floor tracker
+ * (fast attack down, slow rise — the classic ambient estimator)
+ * follows the room's RMS floor, and a trailing peak holds the
+ * loudest recent chunk RMS. At detection both are frozen so PTT can
+ * derive the take's silence threshold from the actual environment
+ * and the actual level of the "Hey Muse" that triggered it. */
+static float ww_ambient_rms_ = 0.0f;
+static float ww_peak_rms_ = 0.0f;
+static int64_t ww_peak_rms_us_ = 0;
+static float ww_detect_ambient_ = 0.0f;
+static float ww_detect_speech_ = 0.0f;
 static wakeword_phrase_t phrase_ = WAKEWORD_PHRASE_BOTH;
 
-static i2s_chan_handle_t ww_i2s_ = NULL;
-static TaskHandle_t ww_task_ = NULL;
-/* v0.4.6: ww_feed runs on PSRAM stack (was 16KB internal). The psram handle
- * is kept; ww_task_ mirrors h->task for the stop logic. */
-static task_psram_handle_t *ww_psram_ = NULL;
+/* v0.4.38: feed and fetch are SEPARATE tasks (see the task section).
+ * Both run on PSRAM stacks (v0.4.6); handles are kept for the stop /
+ * reap protocol. ww_running_ is the cooperative stop flag; the
+ * exited flags let the stopper distinguish a task that left its loop
+ * (reap by freeing its handle directly) from one still inside a
+ * blocking read (delete it). */
+static volatile bool ww_running_ = false;
+static volatile bool ww_feed_exited_ = true;
+static volatile bool ww_fetch_exited_ = true;
+static TaskHandle_t ww_feed_task_ = NULL;
+static TaskHandle_t ww_fetch_task_ = NULL;
+static task_psram_handle_t *ww_feed_psram_ = NULL;
+static task_psram_handle_t *ww_fetch_psram_ = NULL;
 
 static srmodel_list_t *models_ = NULL;
 static afe_config_t *afe_config_ = NULL;
@@ -80,6 +104,15 @@ extern esp_err_t seal_dev_nvs_write_u8_sync(const char *ns, const char *key,
                                             uint8_t val, uint32_t timeout_ms);
 extern esp_err_t seal_dev_nvs_read_u8_sync(const char *ns, const char *key,
                                            uint8_t *out, uint32_t timeout_ms);
+
+/* ptt owns the mic (codec + I2S0); declared extern, same pattern as
+ * the seal helpers above. Defined in ptt.c. */
+extern esp_err_t ptt_mic_acquire(void);
+extern void ptt_mic_release(void);
+extern int ptt_mic_read(void *data, int len);
+/* v0.4.38 diagnostics, defined in ptt.c. */
+extern void ptt_mic_stats(uint32_t *ok, uint32_t *err, int *last_ret,
+                          int32_t *peak);
 
 static void nvs_load(void)
 {
@@ -107,91 +140,23 @@ static void nvs_save_phrase(void)
                                (uint8_t)phrase_, 5000);
 }
 
-/* ---- I2S ---- */
-
-/* Create and enable the I2S0 RX channel for the wake-word feed.
- * Same pins/format as PTT (16kHz/16-bit/mono, mic on RIGHT slot).
- * Returns ESP_OK on success. */
-static esp_err_t ww_i2s_create(void)
-{
-    if (ww_i2s_) {
-        return ESP_OK;
-    }
-    i2s_chan_config_t chan_cfg =
-        I2S_CHANNEL_DEFAULT_CONFIG(WW_I2S_PORT, I2S_ROLE_MASTER);
-    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, NULL, &ww_i2s_),
-                        TAG, "i2s_new_channel");
-
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(WW_SAMPLE_RATE),
-        .slot_cfg = {
-            .data_bit_width = I2S_DATA_BIT_WIDTH_16BIT,
-            .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,
-            .slot_mode = I2S_SLOT_MODE_MONO,
-            .slot_mask = I2S_STD_SLOT_RIGHT, /* mic on RIGHT slot */
-            .ws_width = I2S_DATA_BIT_WIDTH_16BIT,
-            .ws_pol = false,
-            .bit_shift = true,
-            .left_align = true,
-            .big_endian = false,
-            .bit_order_lsb = false,
-        },
-        .gpio_cfg = {
-            .mclk = WW_PIN_MCLK,
-            .bclk = WW_PIN_BCLK,
-            .ws = WW_PIN_WS,
-            .dout = GPIO_NUM_NC,
-            .din = WW_PIN_DIN,
-            .invert_flags = {0},
-        },
-    };
-    esp_err_t err = i2s_channel_init_std_mode(ww_i2s_, &std_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2s std init: %s", esp_err_to_name(err));
-        goto fail;
-    }
-    err = i2s_channel_enable(ww_i2s_);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2s enable: %s", esp_err_to_name(err));
-        goto fail;
-    }
-    return ESP_OK;
-
-fail:
-    if (ww_i2s_) {
-        i2s_del_channel(ww_i2s_);
-        ww_i2s_ = NULL;
-    }
-    return err;
-}
-
-static void ww_i2s_delete(void)
-{
-    if (ww_i2s_) {
-        i2s_channel_disable(ww_i2s_);
-        i2s_del_channel(ww_i2s_);
-        ww_i2s_ = NULL;
-    }
-}
-
 /* ---- AFE ---- */
 
-/* Resolve the wakenet model name(s) for the current phrase setting.
- * Today only "Hi, ESP" exists; the Hey Muse / Hey Watcher models are
- * placeholders until Espressif trains them. Both phrase selections
- * fall back to wn9_hiesp with a warning. */
+/* Resolve the primary wakenet model name for the current phrase
+ * setting. "Hey Muse" shipped in 0.4.37 (wn10_himuse); "Hey Watcher"
+ * was never trained and falls back to himuse with a warning. BOTH
+ * mode adds hiesp as the second model (see afe_init). */
 static const char *ww_model_for_phrase(void)
 {
     switch (phrase_) {
-    case WAKEWORD_PHRASE_HEY_MUSE:
-        ESP_LOGW(TAG, "hey_muse model not yet trained, using %s", WW_MODEL_HIESP);
-        return WW_MODEL_HIESP;
     case WAKEWORD_PHRASE_HEY_WATCHER:
-        ESP_LOGW(TAG, "hey_watcher model not yet trained, using %s", WW_MODEL_HIESP);
-        return WW_MODEL_HIESP;
+        ESP_LOGW(TAG, "hey_watcher model was never trained, using %s",
+                 WW_MODEL_HEY_MUSE);
+        return WW_MODEL_HEY_MUSE;
+    case WAKEWORD_PHRASE_HEY_MUSE:
     case WAKEWORD_PHRASE_BOTH:
     default:
-        return WW_MODEL_HIESP;
+        return WW_MODEL_HEY_MUSE;
     }
 }
 
@@ -226,7 +191,9 @@ static esp_err_t afe_init(void)
     afe_config_->vad_mode = VAD_MODE_3;
     afe_config_->wakenet_init = true;
     afe_config_->wakenet_model_name = (char *)ww_model_for_phrase();
-    afe_config_->wakenet_model_name_2 = NULL; /* 2nd slot for future model */
+    /* BOTH mode: "Hi, ESP" rides along as the second model. */
+    afe_config_->wakenet_model_name_2 =
+        (phrase_ == WAKEWORD_PHRASE_BOTH) ? (char *)WW_MODEL_HIESP : NULL;
     afe_config_->wakenet_mode = DET_MODE_90;
     /* Prefer PSRAM for AFE buffers — internal RAM is precious. */
     afe_config_->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
@@ -262,93 +229,223 @@ static void afe_deinit(void)
     /* models_ is freed on full disable; kept across suspend/resume. */
 }
 
-/* ---- detection task ---- */
+/* ---- detection tasks (v0.4.38) ----
+ * Feed and fetch are separate tasks, the canonical ESP-SR structure.
+ * The pre-0.4.38 single loop called the BLOCKING fetch() after every
+ * 10 ms feed chunk, so the AFE was fed at a fraction of real time and
+ * its fetch side logged "Ringbuffer of AFE is empty, Please use
+ * feed() to write data" every ~204 ms for the whole session. The feed
+ * task now does nothing but read + feed (in 1024-sample blocks from
+ * the codec, sliced to the AFE's feed chunksize), and the fetch task
+ * does nothing but fetch + detect.
+ *
+ * Stop protocol: ww_tasks_stop() clears ww_running_ and waits for
+ * both tasks to leave their loops (feed reads time out at 1 s worst
+ * case; fetch returns on its own ~204 ms cadence) BEFORE the caller
+ * frees the codec — the old code deleted the task wherever it
+ * happened to be, potentially inside esp_codec_dev_read against a
+ * channel about to be torn down. A task that exited on its own is
+ * reaped by freeing its psram handle directly (task_psram_delete
+ * would vTaskDelete a stale handle); a task still stuck after the
+ * wait is deleted the old way. */
+#define WW_READ_SAMPLES 1024
 
-/* Feed I2S -> AFE, fetch results, fire on wake-word. Runs until
- * wakeword_stop() deletes it (or self-deletes on detection so the
- * callback can safely take I2S for PTT). */
-static void ww_task_fn(void *arg)
+/* v0.4.45: ww_reap is defined below ww_tasks_start; the detection
+ * path (ww_fetch_fn) and ww_tasks_start both need it. */
+static void ww_reap(task_psram_handle_t **slot, TaskHandle_t *tslot,
+                    volatile bool *exited);
+
+static void ww_feed_fn(void *arg)
 {
     (void)arg;
     int chunksize = afe_iface_->get_feed_chunksize(afe_data_);
-    int16_t *buf = heap_caps_malloc(chunksize * sizeof(int16_t),
+    int16_t *buf = heap_caps_malloc(WW_READ_SAMPLES * sizeof(int16_t),
                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!buf) {
         ESP_LOGE(TAG, "no mem for feed buffer");
-        ww_task_ = NULL;
+        ww_feed_exited_ = true;
         vTaskDelete(NULL);
     }
-
-    ESP_LOGI(TAG, "listening (chunksize=%d)", chunksize);
-    for (;;) {
-        size_t n = 0;
-        esp_err_t r = i2s_channel_read(ww_i2s_, buf,
-                                      chunksize * sizeof(int16_t), &n,
-                                      pdMS_TO_TICKS(200));
-        if (r == ESP_OK && n > 0) {
-            afe_iface_->feed(afe_data_, buf);
+    ESP_LOGI(TAG, "feed task up (chunksize=%d)", chunksize);
+    int64_t last_log = 0;
+    while (ww_running_) {
+        int ret = ptt_mic_read(buf, WW_READ_SAMPLES * sizeof(int16_t));
+        if (ret == 0) {
+            /* v0.4.44: meter this read — ambient floor + speech
+             * reference for the dynamic silence threshold. */
+            uint64_t ss = 0;
+            for (int i = 0; i < WW_READ_SAMPLES; i++) {
+                int32_t v = buf[i];
+                ss += (uint64_t)(v * v);
+            }
+            float rms = sqrtf((float)((double)ss / WW_READ_SAMPLES));
+            int64_t now_us = esp_timer_get_time();
+            if (ww_ambient_rms_ <= 0.0f) {
+                ww_ambient_rms_ = rms;
+            } else if (rms < ww_ambient_rms_) {
+                ww_ambient_rms_ += (rms - ww_ambient_rms_) * 0.10f;
+            } else {
+                ww_ambient_rms_ += (rms - ww_ambient_rms_) * 0.002f;
+            }
+            if (rms >= ww_peak_rms_ ||
+                now_us - ww_peak_rms_us_ > 1500000) {
+                ww_peak_rms_ = rms;
+                ww_peak_rms_us_ = now_us;
+            }
+            for (int off = 0; off + chunksize <= WW_READ_SAMPLES;
+                 off += chunksize) {
+                afe_iface_->feed(afe_data_, buf + off);
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
+        int64_t now = esp_timer_get_time();
+        if (now - last_log > 5000000) {
+            last_log = now;
+            uint32_t ok, err;
+            int lr;
+            int32_t pk;
+            ptt_mic_stats(&ok, &err, &lr, &pk);
+            ESP_LOGI(TAG,
+                     "mic: reads ok=%lu err=%lu last_ret=%d peak=%ld",
+                     (unsigned long)ok, (unsigned long)err, lr,
+                     (long)pk);
+        }
+    }
+    heap_caps_free(buf);
+    ww_feed_exited_ = true;
+    vTaskDelete(NULL);
+}
+
+static void ww_fetch_fn(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "listening (fetch task up)");
+    while (ww_running_) {
         afe_fetch_result_t *res = afe_iface_->fetch(afe_data_);
         if (res && res->wakeup_state == WAKENET_DETECTED) {
             detections_++;
+            /* v0.4.44: freeze the level references for the take —
+             * the room's floor and the wake phrase's own level. */
+            ww_detect_ambient_ = ww_ambient_rms_;
+            ww_detect_speech_ = ww_peak_rms_;
             ESP_LOGI(TAG, "WAKE WORD detected (model %d, count %lu)",
-                     res->wakenet_model_index, (unsigned long)detections_);
-            /* We're done with I2S: delete our channel BEFORE the
-             * callback runs, so ptt_start_external() -> rec_start()
-             * -> wakeword_stop() -> i2s_acquire() has a clean handoff.
-             * The callback runs in this task's context; we delete
-             * ourselves after it returns. */
-            ww_i2s_delete();
+                     res->wakenet_model_index,
+                     (unsigned long)detections_);
+            ESP_LOGI(TAG, "levels at detection: ambient=%.0f speech=%.0f",
+                     ww_detect_ambient_, ww_detect_speech_);
+            /* Hand the mic to the callback (PTT): stop the feed task
+             * first and wait for it to leave its read, then release —
+             * so ptt_start_external() -> rec_start() ->
+             * wakeword_stop() sees suspended_ and no-ops. Our own
+             * psram handle leaks by design (a task cannot free the
+             * stack it is running on), bounded at 16 KB per detection. */
+            ww_running_ = false;
+            int waited = 0;
+            while (!ww_feed_exited_ && waited < 1500) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                waited += 20;
+            }
+            /* v0.4.45: reap the feed task's corpse. Leaving its
+             * handle non-NULL made the resume's ww_tasks_start()
+             * guard conclude "already running" and start nothing —
+             * the listener never re-armed after a detection
+             * (diagnosed live 2026-11-08 on 0.4.44; button takes
+             * were unaffected because wakeword_stop() reaps both
+             * handles through ww_tasks_stop()). */
+            ww_reap(&ww_feed_psram_, &ww_feed_task_, &ww_feed_exited_);
+            ptt_mic_release();
+            suspended_ = true;
             wakeword_cb_t cb = cb_;
-            ww_task_ = NULL;
-            heap_caps_free(buf);
+            ww_fetch_task_ = NULL;
+            ww_fetch_psram_ = NULL;
+            ww_fetch_exited_ = true;
             if (cb) {
-                cb();
+                cb(res->wakenet_model_index);
             }
             vTaskDelete(NULL);
             /* NOT REACHED */
         }
     }
+    ww_fetch_exited_ = true;
+    vTaskDelete(NULL);
 }
 
-static esp_err_t ww_task_start(void)
+static esp_err_t ww_tasks_start(void)
 {
-    if (ww_task_) {
+    /* v0.4.45: never trust a handle whose task has already exited —
+     * reap corpses first so the guard below only sees live tasks. */
+    if (ww_feed_task_ && ww_feed_exited_) {
+        ww_reap(&ww_feed_psram_, &ww_feed_task_, &ww_feed_exited_);
+    }
+    if (ww_fetch_task_ && ww_fetch_exited_) {
+        ww_reap(&ww_fetch_psram_, &ww_fetch_task_, &ww_fetch_exited_);
+    }
+    if (ww_feed_task_ || ww_fetch_task_) {
         return ESP_OK;
     }
-    /* v0.4.6: PSRAM stack, 4096 words = 16384 bytes (was 16KB internal). */
-    ww_psram_ = task_psram_create(ww_task_fn, "ww_feed", 4096 * 4, NULL, 5,
-                                 tskNO_AFFINITY);
-    if (!ww_psram_) {
-        ww_task_ = NULL;
+    ww_running_ = true;
+    ww_feed_exited_ = false;
+    ww_fetch_exited_ = false;
+    ww_feed_psram_ = task_psram_create(ww_feed_fn, "ww_feed", 4096 * 4,
+                                       NULL, 5, tskNO_AFFINITY);
+    if (!ww_feed_psram_) {
+        ww_running_ = false;
         return ESP_FAIL;
     }
-    ww_task_ = ww_psram_->task;
+    ww_feed_task_ = ww_feed_psram_->task;
+    ww_fetch_psram_ = task_psram_create(ww_fetch_fn, "ww_fetch",
+                                        4096 * 4, NULL, 5,
+                                        tskNO_AFFINITY);
+    if (!ww_fetch_psram_) {
+        ww_running_ = false;
+        return ESP_FAIL;
+    }
+    ww_fetch_task_ = ww_fetch_psram_->task;
     return ESP_OK;
 }
 
-static void ww_task_stop(void)
+/* Reap one task handle after a stop: a task that already exited is
+ * freed directly (its TCB/stack are ours; vTaskDelete on its stale
+ * handle would corrupt the scheduler), a task still alive is deleted
+ * via the helper. The 50 ms grace after an exit flag covers the gap
+ * between the task setting the flag and its vTaskDelete(NULL)
+ * completing on the stack we are about to free. */
+static void ww_reap(task_psram_handle_t **slot, TaskHandle_t *tslot,
+                    volatile bool *exited)
 {
-    if (ww_psram_) {
-        task_psram_handle_t *h = ww_psram_;
-        ww_psram_ = NULL;
-        ww_task_ = NULL;
-        if (xTaskGetCurrentTaskHandle() == h->task) {
-            /* Self-delete: cannot free the PSRAM stack we're running on.
-             * vTaskDelete(NULL) and leak the 16KB (documented, rare —
-             * only on wake-word detection). The handle is also leaked;
-             * both are bounded and PSRAM has 7.6MB free. */
-            vTaskDelete(NULL);
-            /* NOTREACHED */
-        } else {
-            task_psram_delete(h, h->task);
-        }
-    } else if (ww_task_) {
-        TaskHandle_t t = ww_task_;
-        ww_task_ = NULL;
-        /* Safe even if t is the calling task (self-delete). */
-        vTaskDelete(t);
+    task_psram_handle_t *h = *slot;
+    if (!h) {
+        return;
     }
+    *slot = NULL;
+    *tslot = NULL;
+    if (*exited) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        heap_caps_free(h->stack);
+        heap_caps_free(h);
+    } else if (xTaskGetCurrentTaskHandle() == h->task) {
+        vTaskDelete(NULL);
+        /* NOTREACHED */
+    } else {
+        task_psram_delete(h, h->task);
+    }
+}
+
+static void ww_tasks_stop(void)
+{
+    ww_running_ = false;
+    if (xTaskGetCurrentTaskHandle() != ww_feed_task_ &&
+        xTaskGetCurrentTaskHandle() != ww_fetch_task_) {
+        int waited = 0;
+        while ((!ww_feed_exited_ || !ww_fetch_exited_) &&
+               waited < 2500) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            waited += 20;
+        }
+    }
+    ww_reap(&ww_feed_psram_, &ww_feed_task_, &ww_feed_exited_);
+    ww_reap(&ww_fetch_psram_, &ww_fetch_task_, &ww_fetch_exited_);
 }
 
 /* ---- internal start/stop ---- */
@@ -357,9 +454,21 @@ static void ww_task_stop(void)
  * Assumes no other component owns I2S0. */
 static esp_err_t ww_listen_start(void)
 {
-    ESP_RETURN_ON_ERROR(ww_i2s_create(), TAG, "i2s create failed");
+    ESP_RETURN_ON_ERROR(ptt_mic_acquire(), TAG, "mic acquire failed");
     ESP_RETURN_ON_ERROR(afe_init(), TAG, "afe init failed");
-    ESP_RETURN_ON_ERROR(ww_task_start(), TAG, "task start failed");
+    /* v0.4.39: the boot/listen-start mic probe is GONE (John's
+     * ruling: too invasive to trigger without permission — it also
+     * consumed whatever was said during its ~1.2 s window). The
+     * PTT-take-end probe remains: it rides on the user's own button
+     * press. */
+    /* v0.4.40: flush any AFE ringbuffer audio left over from before a
+     * suspend (e.g. the tail of a PTT take) so a resumed listener can
+     * never "detect" stale audio. The AFE instance persists across
+     * suspend/resume; its buffer does not get a free pass. */
+    if (afe_iface_ && afe_iface_->reset_buffer) {
+        afe_iface_->reset_buffer(afe_data_);
+    }
+    ESP_RETURN_ON_ERROR(ww_tasks_start(), TAG, "task start failed");
     suspended_ = false;
     return ESP_OK;
 }
@@ -368,8 +477,8 @@ static esp_err_t ww_listen_start(void)
  * resume). Called by wakeword_stop() for the PTT handoff. */
 static void ww_listen_stop(void)
 {
-    ww_task_stop();
-    ww_i2s_delete();
+    ww_tasks_stop();
+    ptt_mic_release();
     suspended_ = true;
 }
 
@@ -425,6 +534,27 @@ void wakeword_set_enabled(bool enabled)
 bool wakeword_enabled(void)
 {
     return enabled_;
+}
+
+void wakeword_detect_levels(float *ambient_rms, float *speech_rms)
+{
+    if (ambient_rms) {
+        *ambient_rms = ww_detect_ambient_;
+    }
+    if (speech_rms) {
+        *speech_rms = ww_detect_speech_;
+    }
+}
+
+float wakeword_ambient_rms(void)
+{
+    return ww_ambient_rms_;
+}
+
+bool wakeword_listening(void)
+{
+    return ww_running_ && ww_feed_task_ != NULL &&
+           ww_fetch_task_ != NULL;
 }
 
 esp_err_t wakeword_stop(void)

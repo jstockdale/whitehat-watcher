@@ -164,7 +164,8 @@ static void start_transient_locked(transient_t tr)
     /* ERROR and RECORDING are never preempted by transients. Drop the
      * transient and log rather than hiding a critical state. All other
      * backgrounds can be preempted normally. */
-    if (effective_ == LED_STATE_ERROR || effective_ == LED_STATE_RECORDING) {
+    if (effective_ == LED_STATE_ERROR || effective_ == LED_STATE_RECORDING ||
+        effective_ == LED_STATE_REC_ENDING) {
         ESP_LOGW(TAG, "transient %d dropped (background %d active)",
                  (int)tr, (int)effective_);
         return;
@@ -204,7 +205,8 @@ static void render_locked(void)
         transient_t next;
         if (xQueueReceive(boot_queue_, &next, 0) == pdTRUE) {
             /* never let a boot transient hide a critical background */
-            if (effective_ == LED_STATE_ERROR || effective_ == LED_STATE_RECORDING) {
+            if (effective_ == LED_STATE_ERROR || effective_ == LED_STATE_RECORDING ||
+        effective_ == LED_STATE_REC_ENDING) {
                 ESP_LOGW(TAG, "boot transient %d dropped (background %d active)",
                          (int)next, (int)effective_);
             } else {
@@ -299,6 +301,11 @@ static void render_locked(void)
     case LED_STATE_ERROR:
         show(scale(C_RED, 0.25f + 0.75f * breathe_k(bt, 1200)));
         break;
+    case LED_STATE_REC_ENDING:
+        /* blinking red — still recording, but trailing silence has
+         * been heard and the take will end shortly (v0.4.44). */
+        show(blink_on(bt, 500, 0.5f) ? C_RED : C_OFF);
+        break;
     case LED_STATE_RECORDING:
         show(C_RED); /* steady — mic is hot */
         break;
@@ -324,6 +331,7 @@ static void render_locked(void)
         /* legacy: no longer used as fallback, treated as off */
         show(C_OFF);
         break;
+
     case LED_STATE_OFF:
     default:
         show(C_OFF);

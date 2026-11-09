@@ -75,6 +75,15 @@ void display_hide_message(void);
 /** True while the message view is showing. */
 bool display_message_visible(void);
 
+/** v0.4.46: visible-area diagnostic — concentric colored rings
+ *  (r=200..30, step 10, radius printed at 3 o'clock) over black.
+ *  The panel is round and the bezel's black band clips the outer
+ *  rings; the largest fully-visible ring per direction measures
+ *  the true safe area for UI margins. Click dismisses. */
+void display_show_ring_test(void);
+void display_hide_ring_test(void);
+bool display_ring_test_visible(void);
+
 /** Scroll the message view (positive detents = down). Thread-safe. */
 void display_message_scroll(int detents);
 

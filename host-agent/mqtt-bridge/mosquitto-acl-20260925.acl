@@ -1,9 +1,8 @@
-# Mosquitto ACL — mqtt.offx1.com (authoritative, 2026-09-27)
-# 2026-09-27: applied audit 4a (heartbeat write grants for watcher) +
-# 4b/4c (keepalive/jiggle directional splits for console 0.4.86).
-# Drop-in replacement for the 2026-09-25 file. After applying on the
-# broker, re-mirror: copy this file over mosquitto-acl-20260925.acl
-# (or re-paste from the broker) so the local mirror matches.
+# Mosquitto ACL — mqtt.offx1.com (authoritative, 2026-11-07)
+# John confirmed this ACL was applied to the broker on 2026-11-07.
+# It adds the watcher write grant for watcher/audio so the console
+# page can publish audio directly to the bridge instead of batching
+# audio chunks into watcher/telemetry.
 
 # ============ muse user (bridge subscriber + Muse agent) ============
 user muse
@@ -40,6 +39,9 @@ user watcher
 # Page publishes telemetry and status to the bridge
 topic write watcher/telemetry
 topic write watcher/status
+
+# Audio: page publishes PTT/wake-word audio directly to the bridge
+topic write watcher/audio
 # Heartbeats: page publishes device + console heartbeats (audit 4a, 2026-09-27)
 topic write watcher/heartbeat
 topic write watcher/console_heartbeat
@@ -65,10 +67,11 @@ topic readwrite watcher/muse_queue
 # 1. RESOLVED 2026-09-27 (audit 4a): watcher/heartbeat and
 #    watcher/console_heartbeat now have `topic write` for the watcher
 #    user. Previously silently dropped by the broker (default-deny).
-# 2. No user has write on watcher/audio (muse: read; watcher: none).
-#    The page currently batches audio chunks into watcher/telemetry
-#    instead; watcher/audio is aspirational ("preferred once the
-#    console routes t:audio here" per subscriber.py).
+# 2. UPDATED 2026-11-07: watcher now has write on watcher/audio
+#    (muse already had read). This removes the broker-side blocker to
+#    the console routing t:audio messages directly to watcher/audio
+#    instead of batching them into watcher/telemetry. The console
+#    routing change itself remains separate.
 # 3. muse has read-only on watcher/jiggle and watcher/keepalive, plus
 #    write on the new watcher/jiggle_bridge + watcher/keepalive_bridge
 #    (single-writer splits, audit 4b/4c). Direct bridge writes to the
@@ -81,8 +84,6 @@ topic readwrite watcher/muse_queue
 #    from watcher-console.html). Run the static audit before shipping
 #    any bridge/console patch and after any broker ACL change
 #    (re-mirror this file first).
-# 5. 2026-09-27: after applying this file on the broker, tell Muse so
-#    the local mirror (mosquitto-acl-20260925.acl) can be updated and
-#    the static audit re-run. Until then the audit correctly reports
-#    the new bridge topics as DENY and bridge publishes there stay
-#    blocked loudly.
+# 5. 2026-11-07: John confirmed the broker was updated, the local
+#    mirror (mosquitto-acl-20260925.acl) was synced to this file, and
+#    the static audit was re-run against the mirrored broker state.
