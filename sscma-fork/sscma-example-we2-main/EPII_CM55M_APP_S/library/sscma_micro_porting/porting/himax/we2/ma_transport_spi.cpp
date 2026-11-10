@@ -56,6 +56,24 @@ __attribute__((section(".noinit"))) volatile uint32_t g_fault_dump[8];
  * implicit: the next command's normal handler restores GPIO13-LOW. */
 #define FEATURE_TRANSPORT_CMD_PARK      0x09
 
+/* v0.4.20.62 (link-hardening spec §5.6): injection hooks for the WI-4/
+ * WI-5 bench tests. COMPILE-TIME ONLY, DEFAULT OFF — the release build
+ * contains none of this (the shipped .62 is built with the switch off
+ * and verified so). With the switch on, transport cmd 0x0A selects an
+ * injection via the len field: 1 = fail the next spi_open once,
+ * 2 = park the transport in the H-B unclaimed state (open, RX unarmed,
+ * all claim flags false), 3 = stall the AT loop 60 s after the next
+ * non-hook command is parsed (the H2 simulation). */
+#ifndef WATCHER_LINK_TEST_HOOKS
+#define WATCHER_LINK_TEST_HOOKS 0
+#endif
+#if WATCHER_LINK_TEST_HOOKS
+#define FEATURE_TRANSPORT_CMD_TEST_HOOK 0x0A
+static volatile uint32_t _test_open_fails     = 0;
+static volatile bool     _test_stall_pending  = false;
+static volatile bool     _test_stall_cmd_seen = false;
+#endif
+
 /* v0.4.14 (P1): CRC16-CCITT (poly 0x1021, init 0xFFFF). Mirrored on the
  * S3 (sscma_client_io_spi.c). Covers S3->Himax command packets
  * (header+payload) and Himax->S3 bulk data. */
@@ -108,6 +126,13 @@ static volatile bool         _spi_opened = false;
  * The v0.4.6 approach of retrying inside _spi_rx_callback was dead code:
  * a failed arm leaves RX disarmed, so no callback can fire to consume it. */
 static volatile bool         _spi_rx_arm_failed = false;
+/* v0.4.20.62 (WI-5 H-B): RX-armed tracker. Set by a successful
+ * spi_read_dma in either arm path; cleared when the RX DMA completes
+ * (entry of _spi_rx_callback — completion is what disarms RX), when
+ * the transport is cycled, and at deInit. Deliberately independent of
+ * the staged/done/arm_failed bookkeeping: H-B exists to catch states
+ * those three flags fail to claim, so it must not trust them. */
+static volatile bool         _spi_rx_armed = false;
 /* v0.4.20.54 (Claude PARK): parked flag. When true, the MISO flag (PB2) is
  * released (tristate) instead of driven LOW. Set by CMD_PARK, cleared by
  * any subsequent command's normal handler (which restores GPIO13-LOW). */
@@ -500,9 +525,22 @@ static inline void _spi_diag_record(uint8_t where, int32_t rc, uint32_t len) {
 
 static void _spi_rx_callback(void* param);
 static void _spi_tx_callback(void* param);
+/* v0.4.20.62: defined beside spi_poll(); the TEST_HOOK injection in
+ * _spi_rx_callback needs it before that definition point. */
+static bool _spi_transport_cycle();
 
 static void _spi_arm_rx() {
-    if (!_spi_dev || !_spi_opened) {
+    if (!_spi_dev) {
+        return;
+    }
+    if (!_spi_opened) {
+        /* v0.4.20.62 (WI-4 H-A(1)): never fail silently. A closed
+         * transport with RX unarmed is the incident's end-state;
+         * setting the flag hands the state to Guard 3, whose block
+         * head now retries the open before the arm. (The !_spi_dev
+         * case above stays silent: the transport was never
+         * initialized and Guard 3 has nothing to escalate to.) */
+        _spi_rx_arm_failed = true;
         return;
     }
     std::memset(_spi_rx_buf, 0, SPI_PACKET_SIZE);
@@ -520,6 +558,7 @@ static void _spi_arm_rx() {
         return;
     }
     _spi_rx_arm_failed = false;
+    _spi_rx_armed = true;  /* v0.4.20.62 (WI-5 H-B tracker) */
     /* v0.4.20.38 (Phase 2): MISO-flag LOW = RX armed, safe to send command.
      * Mux PB2 to GPIO13 (driven LOW). This must happen AFTER RX DMA is armed. */
     hx_drv_scu_set_PB2_pinmux(SCU_PB2_PINMUX_GPIO13, 1);
@@ -534,7 +573,15 @@ static void _spi_arm_rx() {
  * slave tristates DO, so the S3's pull-up takes the line HIGH. The Himax
  * stays RX-armed and silent; SD can safely drive MISO. */
 static void _spi_arm_rx_parked() {
-    if (!_spi_dev || !_spi_opened) {
+    if (!_spi_dev) {
+        return;
+    }
+    if (!_spi_opened) {
+        /* v0.4.20.62 (WI-4 H-A(1)): same never-silent rule as
+         * _spi_arm_rx — the spec's §5.2 invariant (no reachable state
+         * with all claim flags false, RX unarmed, transport closed)
+         * must hold for both arm entry points. */
+        _spi_rx_arm_failed = true;
         return;
     }
     std::memset(_spi_rx_buf, 0, SPI_PACKET_SIZE);
@@ -546,6 +593,7 @@ static void _spi_arm_rx_parked() {
         return;
     }
     _spi_rx_arm_failed = false;
+    _spi_rx_armed = true;  /* v0.4.20.62 (WI-5 H-B tracker) */
     /* v0.4.20.56 (Claude F4): PARKED must explicitly mux PB2 to SPI_S_DO.
      * The old comment assumed PB2 was "SPI_S_DO from the last TX", but
      * PARK arrives while PB2 is GPIO13-driven-LOW (that's how the command
@@ -590,6 +638,11 @@ static bool _spi_frame_crc_ok(size_t o, uint8_t cmd, uint16_t len) {
 
 static void _spi_rx_callback(void* param) {
     (void)param;
+
+    /* v0.4.20.62 (WI-5 H-B tracker): the RX DMA has completed, so RX
+     * is unarmed from here until a handler re-arms (or stages a TX,
+     * which the staged flag claims). */
+    _spi_rx_armed = false;
 
     // DMA has written the received packet to _spi_rx_buf. Invalidate the DCache
     // so the CPU reads the DMA'd data, not stale cached lines.
@@ -704,6 +757,13 @@ static void _spi_rx_callback(void* param) {
     _spi_tx_staged_us = 0;
     _spi_tx_done = false;
     _spi_tx_done_us = 0;
+#if WATCHER_LINK_TEST_HOOKS
+    /* Injection selector 3: a real command was parsed after the stall
+     * was armed — spi_poll performs the stall on its next pass. */
+    if (_test_stall_pending && cmd != FEATURE_TRANSPORT_CMD_TEST_HOOK) {
+        _test_stall_cmd_seen = true;
+    }
+#endif
     /* v0.4.10: the len field means different things per command. For WRITE
      * it is the payload length (capped at SPI_MAX_PL_LEN=250). For READ it
      * is the number of response bytes the S3 wants clocked out (the S3
@@ -1057,6 +1117,34 @@ static void _spi_rx_callback(void* param) {
         _spi_arm_rx_parked();
         break;
 
+#if WATCHER_LINK_TEST_HOOKS
+    case FEATURE_TRANSPORT_CMD_TEST_HOOK: {
+        /* v0.4.20.62 (spec §5.6): injection trigger; len selects.
+         * No-response command, like PARK. Compiled out of release. */
+        if (len == 1) {
+            /* Fail the next spi_open once (Guard 2/3 teardown tests). */
+            _test_open_fails = 1;
+            _spi_arm_rx();
+        } else if (len == 2) {
+            /* Park in the H-B unclaimed state: cycle to a fresh
+             * controller, then deliberately do NOT arm and leave every
+             * claim flag false, PB2 released (the wedge's signature).
+             * H-B must fire within ~2 s and recover the link. */
+            _spi_transport_cycle();
+            _spi_rx_arm_failed = false;
+            hx_drv_scu_set_PB2_pinmux(SCU_PB2_PINMUX_SPI_S_DO, 1);
+        } else if (len == 3) {
+            /* Stall the AT loop 60 s after the next real command. */
+            _test_stall_pending = true;
+            _test_stall_cmd_seen = false;
+            _spi_arm_rx();
+        } else {
+            _spi_arm_rx();
+        }
+        break;
+    }
+#endif
+
     default:
         _spi_arm_rx();
         break;
@@ -1209,6 +1297,7 @@ void SPI::deInit() {
     }
 
     _spi_opened = m_initialized = false;
+    _spi_rx_armed = false;  /* v0.4.20.62 (WI-5 H-B tracker hygiene) */
 }
 
 size_t SPI::available() const { return _spi_rb_rx ? _spi_rb_rx->size() : 0; }
@@ -1263,8 +1352,118 @@ void spi_bulk_prepare(const uint8_t* buf, size_t len) {
     _spi_bulk_offset = 0;
 }
 
+/* v0.4.20.62 (WI-4/WI-5): the one spi_open attempt path — shared by
+ * the teardown cycle below and Guard 3's block-head retry. Applies
+ * the (compile-time-off) open-failure injection when built in. */
+static bool _spi_try_open() {
+    if (!_spi_dev) {
+        return false;
+    }
+#if WATCHER_LINK_TEST_HOOKS
+    if (_test_open_fails > 0) {
+        _test_open_fails--;
+        return false;
+    }
+#endif
+    if (_spi_dev->spi_open(DEV_SLAVE_MODE, SPI_CPOL_0_CPHA_0) == 0) {
+        _spi_opened = true;
+    }
+    return _spi_opened;
+}
+
+/* v0.4.20.62 (WI-4/WI-5): the one teardown path, shared by Guard 2,
+ * Guard 3 and the H-B watchdog (spec §6.1 asks for the factoring):
+ * cycle SSIENR via spi_close/spi_open, which resets controller + DMA
+ * state. Returns true iff the transport is open afterwards. Flag
+ * policy stays with the callers: Guard 3 (H-A(2)) keeps
+ * _spi_rx_arm_failed set when this returns false and skips its arm;
+ * Guard 2 / H-B arm afterwards and let _spi_arm_rx()'s H-A(1)
+ * behaviour report a still-closed transport into Guard 3. */
+static bool _spi_transport_cycle() {
+    if (!_spi_dev) {
+        return false;
+    }
+    _spi_rx_armed = false;  /* the close kills any outstanding RX DMA */
+    if (_spi_opened) {
+        _spi_dev->spi_close();
+        _spi_opened = false;
+    }
+    return _spi_try_open();
+}
+
+/* v0.4.20.62 (WI-4 H-C): verify the arm took. The arm's DMA half is
+ * proven by spi_read_dma's return code; its flag-line half — PB2
+ * muxed to GPIO13 and driven LOW — was previously taken on faith, and
+ * a lost mux write leaves the S3 facing a permanently HIGH line with
+ * every Himax flag reading healthy. Read both halves back through
+ * the driver (post-arm, so the S3-visible re-arm gains no latency;
+ * invariant 2 permits post-arm readbacks). Only a POSITIVE mismatch
+ * fails the arm — a readback error abstains, in the same spirit as
+ * the re-arm probes' dead-probe abstention — and failure is reported
+ * the Guard-3 way: _spi_rx_arm_failed. */
+static void _spi_verify_arm_took() {
+    SCU_PINMUX_CFG_T cfg;
+    if (hx_drv_scu_get_all_pinmux_cfg(&cfg) != SCU_NO_ERROR) {
+        return;
+    }
+    if (cfg.pin_pb2 != SCU_PB2_PINMUX_GPIO13) {
+        _spi_rx_arm_failed = true;
+        return;
+    }
+    uint8_t level = 1;
+    if (hx_drv_gpio_get_in_value(GPIO13, &level) != GPIO_NO_ERROR) {
+        return;
+    }
+    if (level != GPIO_OUT_LOW) {
+        _spi_rx_arm_failed = true;
+    }
+}
+
+/* v0.4.20.62 (WI-5): spi_poll instrumentation/watchdog state. */
+static int64_t _poll_last_call_us    = 0;
+static int64_t _poll_max_gap_us      = 0;
+static int64_t _spi_unclaimed_since_us = 0;
+
 void spi_poll() {
-    if (!_spi_opened) {
+    /* v0.4.20.62 (WI-5 H-D): poll-gap instrumentation — the H1/H2
+     * discriminator. Runs BEFORE the closed-transport early return on
+     * purpose: in the H1 end-state the AT loop keeps calling spi_poll
+     * (gaps stay ~1 ms — loop alive, state uncovered), while an H2
+     * AT-thread stall appears as one gap ≈ the stall duration when
+     * the loop resumes. Gaps are only measured while the transport is
+     * supposed to be live (open, or closed with an arm failure pending
+     * recovery), so an intentional deInit accrues no spurious gap. */
+    {
+        int64_t now_us = ma_get_time_us();
+        bool live = _spi_opened || _spi_rx_arm_failed;
+        if (live && _poll_last_call_us != 0) {
+            int64_t gap_us = now_us - _poll_last_call_us;
+            if (gap_us > _poll_max_gap_us) {
+                _poll_max_gap_us = gap_us;
+            }
+            if (gap_us > 500000) {
+                diag_nb_emit("E DIAG POLL_GAP %ld", (long)(gap_us / 1000));
+            }
+        }
+        _poll_last_call_us = live ? now_us : 0;
+    }
+#if WATCHER_LINK_TEST_HOOKS
+    /* Injection selector 3: stall the AT loop once, for 60 s, after a
+     * real command was parsed. The busy-wait is the point — the poll,
+     * and with it the AT loop, must stop calling in (the H2 shape). */
+    if (_test_stall_pending && _test_stall_cmd_seen) {
+        _test_stall_pending  = false;
+        _test_stall_cmd_seen = false;
+        int64_t stall_end = ma_get_time_us() + 60000000;
+        while (ma_get_time_us() < stall_end) {
+        }
+    }
+#endif
+    /* v0.4.20.62 (WI-4 H-A(2)): the early return must not fire while
+     * an arm failure is pending — with _spi_opened false the Guard-3
+     * block below is the only thing that can retry the open, and the
+     * pre-.62 head check made it unreachable, sealing the wedge. */
+    if (!_spi_opened && !_spi_rx_arm_failed) {
         return;
     }
     if (_spi_diag.pending) {
@@ -1310,12 +1509,25 @@ void spi_poll() {
     diag_nb_drain();
     if (_spi_rx_arm_failed) {
         _spi_rx_arm_failed = false;
-        /* v0.4.20.56 (Claude F4): Park-aware retry. If parked, re-arm via
-         * the parked path to avoid driving LOW mid-SD-transaction. */
-        if (_spi_parked) {
-            _spi_arm_rx_parked();
+        /* v0.4.20.62 (WI-4 H-A(2)): if a previous teardown's spi_open
+         * failed, the transport is closed and the arm below cannot
+         * succeed — retry the open FIRST (at most one open attempt per
+         * Guard-3 entry; this block is the escalation cycle). */
+        if (!_spi_opened && _spi_dev) {
+            _spi_try_open();
+        }
+        if (_spi_opened) {
+            /* v0.4.20.56 (Claude F4): Park-aware retry. If parked, re-arm via
+             * the parked path to avoid driving LOW mid-SD-transaction. */
+            if (_spi_parked) {
+                _spi_arm_rx_parked();
+            } else {
+                _spi_arm_rx();
+            }
         } else {
-            _spi_arm_rx();
+            /* Open still failing: stay in Guard 3 (counted below); the
+             * next entry retries open+arm on the existing cadence. */
+            _spi_rx_arm_failed = true;
         }
         /* v0.4.20.52 (Claude Q4 Guard 3): arm-failure escalation. If the
          * retry also failed, count it. After ~10 consecutive failures,
@@ -1333,20 +1545,22 @@ void spi_poll() {
                 _spi_tx_done = false;
                 _spi_tx_done_us = 0;
                 _rearm_probe_drop();
-                if (_spi_dev && _spi_opened) {
-                    _spi_dev->spi_close();
-                    _spi_opened = false;
-                    if (_spi_dev->spi_open(DEV_SLAVE_MODE, SPI_CPOL_0_CPHA_0) == 0) {
-                        _spi_opened = true;
+                if (_spi_transport_cycle()) {
+                    _spi_rx_arm_failed = false;
+                    /* v0.4.20.56 (Claude F4): Park-aware escalation re-arm. */
+                    if (_spi_parked) {
+                        _spi_arm_rx_parked();
+                    } else {
+                        _spi_arm_rx();
                     }
                 }
-                _spi_rx_arm_failed = false;
-                /* v0.4.20.56 (Claude F4): Park-aware escalation re-arm. */
-                if (_spi_parked) {
-                    _spi_arm_rx_parked();
-                } else {
-                    _spi_arm_rx();
-                }
+                /* v0.4.20.62 (WI-4 H-A(2)): if the cycle's open failed,
+                 * _spi_rx_arm_failed STAYS true and the arm is skipped.
+                 * The pre-.62 code cleared the flag unconditionally at
+                 * this point, which — combined with the then-silent
+                 * _spi_arm_rx — manufactured the incident's
+                 * unrecoverable end-state: all claim flags false, RX
+                 * unarmed, transport closed, no guard able to fire. */
             }
         } else {
             _spi_rx_arm_fail_count = 0;
@@ -1472,6 +1686,14 @@ void spi_poll() {
             _spi_tx_staged = false;
             _spi_tx_staged_us = 0;
             _spi_arm_rx();
+            /* v0.4.20.62 (WI-4 H-C): verify the arm took (PB2 mux +
+             * GPIO13 level readback). Skipped when the arm already
+             * reported a DMA failure — nothing to verify, Guard 3
+             * owns that state. A mismatch is handed to Guard 3 via
+             * _spi_rx_arm_failed and acted on at the next poll. */
+            if (!_spi_rx_arm_failed) {
+                _spi_verify_arm_took();
+            }
             _rearm_probe_finish(signal_arm, (int32_t)elapsed);
             /* Learn the TXAVAIL capacity (post-re-arm the TX FIFO is
              * empty by construction). */
@@ -1499,16 +1721,47 @@ void spi_poll() {
             _spi_tx_done = false;
             _spi_tx_done_us = 0;
             _rearm_probe_drop();
-            if (_spi_dev && _spi_opened) {
-                _spi_dev->spi_close();
-                _spi_opened = false;
-                if (_spi_dev->spi_open(DEV_SLAVE_MODE, SPI_CPOL_0_CPHA_0) == 0) {
-                    _spi_opened = true;
-                }
-            }
+            /* v0.4.20.62 (WI-5 factoring): the shared teardown path.
+             * If the re-open fails, the arm below now reports the
+             * closed transport into Guard 3 via H-A(1) instead of
+             * silently no-oping (the pre-.62 behaviour). */
+            _spi_transport_cycle();
             _spi_arm_rx();
         }
     }
+    /* v0.4.20.62 (WI-5 H-B): flag-independent stuck-unarmed watchdog.
+     * Guards 1-3 each key on a flag (done / staged / arm_failed); the
+     * incident state had all three false with RX unarmed, so nothing
+     * could ever fire. H-B keys on the armed tracker instead: the
+     * transport is open, no RX DMA is outstanding, and NO known
+     * in-flight state claims the link (no staged TX, no TX awaiting
+     * Guard 1, no arm-failure escalation in progress, no bulk feeder),
+     * continuously for >2 s — then force the shared teardown + re-arm.
+     * 2 s is ~6x Guard 2's 300 ms worst legitimate unarmed window;
+     * every known state exempts itself, so on a healthy link this
+     * never fires. (_spi_parked needs no explicit exemption: a parked
+     * arm is a real arm, so _spi_rx_armed is true while parked; the
+     * recovery below is still park-aware out of caution.) */
+    if (_spi_opened && !_spi_rx_armed && !_spi_tx_staged &&
+        !_spi_tx_done && !_spi_rx_arm_failed && !_spi_bulk_armed) {
+        int64_t now_us = ma_get_time_us();
+        if (_spi_unclaimed_since_us == 0) {
+            _spi_unclaimed_since_us = now_us;
+        } else if (now_us - _spi_unclaimed_since_us > 2000000) {
+            _spi_unclaimed_since_us = 0;
+            _spi_wd_aborts++;
+            diag_nb_emit("E DIAG STUCK_UNARMED teardown");
+            _spi_transport_cycle();
+            if (_spi_parked) {
+                _spi_arm_rx_parked();
+            } else {
+                _spi_arm_rx();
+            }
+        }
+    } else {
+        _spi_unclaimed_since_us = 0;
+    }
+
     /* v0.4.14 (P1): bulk feeder. While armed (S3 sent CMD_START after
      * AT+SPIDUMP), push the staged capture buffer into the TX ring for the
      * S3 to drain with CMD_READ_CRC. push() is non-blocking; a full ring
