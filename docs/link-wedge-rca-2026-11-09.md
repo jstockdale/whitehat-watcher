@@ -987,3 +987,120 @@ two wedges, both onsets inside ~180 ms of the crop reply.
    with no S3 reboot).
 4. The pending dim-screen strip capture is blocked on the same
    bounce: crop remains set on the Himax and clears on its reset.
+
+---
+
+## Addendum 2 — 2026-11-09 ~23:50 UTC: H1 vs H2 under the CROP-trigger evidence
+
+Appended by the link-hardening spec pass
+(`docs/link-hardening-spec-2026-11-09.md`). The 22:39 addendum above
+records the second wedge's evidence; this addendum adds only the
+analysis that evidence now supports. No body text is changed.
+
+### A2.1 The wedging exchanges completed end-to-end — the state forms at the final re-arm
+
+In both incidents the crop exchange that preceded the wedge was
+*fully successful on the wire*, and that fact localises the stuck
+state far more tightly than "after the crop set":
+
+- The S3's AT+CROP write passed the LOW gate (RX was armed), the
+  Himax executed the command, the reply was staged, the S3's
+  AVAILABLE poll passed the gate and clocked out the count, and
+  the READ passed the gate and clocked out the reply bytes — the
+  `set_crop` log lines show the reply received with `code 0` and
+  the new geometry echoed.
+- Each of those clock-outs sets `_spi_tx_done` on the Himax and
+  requires a Guard-1 re-arm before the next S3 command can pass
+  the LOW gate. At least one complete Guard-1 re-arm cycle
+  therefore succeeded *inside* each wedging exchange (after the
+  AVAILABLE count clock-out). The re-arm that never took effect
+  is the **last one of the exchange** — after the final clock-out
+  of the CROP response.
+- The first failed poll follows ≤179 ms later. The idle gaps
+  before each incident (45 min in the first, ~3.5 min in the
+  second) are thereby excluded as the formation window: the link
+  was provably alive at the start of the wedging exchange and
+  dead ≤179 ms after its end. The stuck state forms **during or
+  immediately after the response clock-out**, on the re-arm path.
+
+### A2.2 Both wedges followed the full path through setCropWindow
+
+`setCropWindow` has two paths (verified in the tree,
+`ma_camera_himax.cpp:400-497`):
+
+- **Fast path** (`:425-435`): `_crop_w != 0` and the new window has
+  the same byte count → `drv_ov5647_recrop_fullres` only; no
+  deInit, no sensor re-init.
+- **Full path** (`:438-488`): `deInit()`, the persistent-buffer
+  step (the 0.4.20.61 fix, `:445-487`), `drv_ov5647_set_raw_buffer`,
+  `drv_ov5647_init_raw_fullres`.
+
+`clearCropWindow()` zeroes `_crop_w` (`:499-509`), so any set
+after a clear — or after a Himax reboot — takes the full path.
+The day's five code-0 sets, by path:
+
+| Set (UTC) | Path | Outcome |
+|---|---|---|
+| 20:23:47 | full (first set ever) | clean |
+| 20:28:15 | fast (same byte count, crop already set) | clean |
+| 21:16:51 | full (cleared 20:30:28) | **WEDGED, +178 ms** |
+| 22:33:52 | full (first set after Himax reboot) | clean |
+| 22:39:18 | full (cleared ~22:35) | **WEDGED, +179 ms** |
+
+Full path: 2 wedges in 4 executions. Fast path: 0 in 1. In this
+sample the full path — the one running the heavy sensor re-init
+immediately before the reply — looks **necessary but not
+sufficient**: a race, needing a second, timing-dependent
+ingredient. (n is small; treat the path correlation as a strong
+lead, not a proof.)
+
+### A2.3 What this does to H1 vs H2
+
+- **H1 (transport bookkeeping hole) — weight increases.** The
+  failure now sits exactly on the path H1 describes: the Guard-1
+  re-arm after a completed TX, with Guard 3's teardown and its
+  failed-`spi_open` end-state (`ma_transport_spi.cpp:1336-1355`,
+  plus the unconditional `_spi_rx_arm_failed` clear at `:1343`)
+  as the escalation route if that re-arm's `spi_read_dma` failed.
+  The whole chain fits inside the 179 ms window: Guard 3 counts
+  one failure per spi_poll retry, and its teardown + failed open
+  + silent `_spi_arm_rx()` no-op (`:504-507`) can complete in
+  milliseconds. H-C's variant (the arm call returns E_OK but the
+  PB2 mux/drive does not take, leaving no flag set anywhere)
+  sits on the same spot and is indistinguishable from H1's
+  end-state from outside — H-A/H-C together close both.
+- **H2 (AT/executor thread stall) — weight decreases, not
+  closed.** The thread had *just* completed a full
+  multi-transaction exchange, including the heavy `setCropWindow`
+  call itself, which returned before the reply was composed
+  (§1.4). An H2 stall must therefore begin in the ≤179 ms
+  post-reply window, on code that runs after every AT reply —
+  code that also ran cleanly after the 20:23, 20:28 and 22:33
+  crop replies and after every other AT exchange of the day.
+  No blocking call on that post-reply path has been identified.
+  H2's remaining plausible locus is narrower than §1.4 stated:
+  something the *full-path* sensor re-init starts or leaves
+  behind that the AT thread touches only after the reply. Only
+  the H-D poll-gap counter or a UART capture of a recurrence
+  closes H2; both remain in the plan.
+- **Net:** the S3-first ordering in §4 is unchanged (the ladder
+  is hypothesis-independent), but the Himax work is no longer
+  "reduce incidence" in the abstract — H-A/H-C address the
+  specific re-arm step both incidents died on, and they are
+  co-equal in evidentiary support with the ladder.
+
+### A2.4 The acceptance soak is a targeted regression test, not a generic one
+
+Because the trigger is now a specific command on a specific
+path, the soak in the hardening spec is designed against it:
+every cycle's crop set is preceded by a crop **clear**, forcing
+the full path (`deInit` + `init_raw_fullres`) every time. This
+matters because the two soak geometries have identical byte
+counts (2592×486 = 1296×972 = 1,259,712), so *without* the
+clear, alternate sets would silently take the fast path and the
+soak would stop testing the trigger while appearing to run it.
+At the observed full-path rate (2/4), a 20-cycle soak expects
+multiple onsets on pre-hardening firmware; even at a true rate
+of 10%, the chance of no onset in 20 full-path sets is ~12% —
+a clean run is evidence, and an onset the ladder recovers
+in-session is the fix demonstrating itself.

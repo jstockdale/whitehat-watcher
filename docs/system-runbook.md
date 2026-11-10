@@ -1,6 +1,6 @@
 # Watcher System Runbook
 
-**Last updated:** 2026-10-06
+**Last updated:** 2026-11-10
 **Purpose:** Reference for build systems, command systems, MQTT, and bench capabilities. Created per John's request — "this isn't the first time you have forgotten we have bench capabilities."
 
 ---
@@ -14,26 +14,26 @@
 - **Merge:** `idf.py merge-bin -o <absolute-path>` (MUST use absolute path; reads `build/flash_args`)
   - Factory partition at 0x20000 (not 0x10000 — v0.1.7 shipped non-booting image because of this)
 - **Version:** `firmware/main/main.c` → `#define FW_VERSION "x.y.z"`
-- **Current:** 0.4.18.35
+- **Current:** 0.4.51
 - **Deliver:** Via MQTT `transfer-flash.py` (John clicks "Yes, flash it" in page)
 
 ### Himax (HX6538 WE2) Firmware
 - **Source:** `~/workspace/projects/watcher-input-assistant/sscma-fork/sscma-example-we2-main/`
 - **Toolchain:** ARM GNU 13.2 — `export PATH=~/workspace/arm-gnu-toolchain-13.2.Rel1-x86_64-arm-none-eabi/bin:$PATH`
-- **Build:** `cd EPII_CM55M_APP_S && make -j$(nproc)` (makefile is in `EPII_CM55M_APP_S/`, NOT top level!)
+- **Build:** `cd EPII_CM55M_APP_S && make cleanbuild` (regenerates the build fingerprint + full clean — required for every build; makefile is in `EPII_CM55M_APP_S/`, NOT top level!)
 - **Version:** `EPII_CM55M_APP_S/library/sscma_micro/sscma/server/at/callback/watcher_build_hash.h` → `#define WATCHER_FW_ID`
 - **Package:** 
   1. `cp EPII_CM55M_APP_S/obj_epii_evb_icv30_bdv10/gnu_epii_evb_WLCSP65/EPII_CM55M_gnu_epii_evb_WLCSP65_s.elf we2_image_gen_local/input_case1_secboot/`
   2. `cd we2_image_gen_local && ./we2_local_image_gen project_case1_blp_wlcsp.json`
   3. Output: `output_case1_sec_wlcsp/output.img`
   4. Verify: `strings output.img | grep "watcher-himax-"`
-- **Current:** 0.4.20.39
+- **Current:** 0.4.20.62
 - **Deliver:** Via `curl` + `sha256sum` (NEVER attachment — corrupts binary). John flashes via XMODEM.
-- **Critical:** Always `touch` source before `make`; always copy FRESH ELF before image gen (silently packages stale ELF otherwise)
+- **Critical:** Always `make cleanbuild` (partial rebuilds ship stale objects — the tree's header dependency tracking is broken); always copy FRESH ELF before image gen (silently packages stale ELF otherwise)
 
 ### Version Rules (John)
 - Every distinct binary gets a unique version. Never reuse a version number.
-- Format: S3 `0.4.18.x`, Himax `0.4.20.x`
+- Format: S3 `0.4.x`, Himax `0.4.20.x`
 
 ---
 
@@ -136,8 +136,8 @@ Send via: `python3 send_command.py '{"t":"dbg","cmd":"..."}'` (from `host-agent/
 - Independent review proved PB8 path electrically broken
 
 ### Current Status
-- **Spitest:** 16/16 ✅ (MISO-flag validated)
-- **Bulk/PNG:** Blocked by camera capture issue (not SPI)
+- **Spitest:** 159/160 across two 80-test batches (MISO-flag + parser scan-realignment validated)
+- **Bulk/PNG:** Working — full 1296×972 frames in ~4 s, byte-exact; 1:1 crop windows live since Himax 0.4.20.61
 
 ---
 

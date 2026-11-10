@@ -4,7 +4,7 @@ How the Watcher bench link actually works. No theory, just the path.
 
 ## Pieces
 
-- **Page**: `watcher-console.html` (currently v0.4.31), served by John locally.
+- **Page**: `watcher-console.html` (currently v0.4.190), served by John locally.
   Holds the WebSerial port. Everything flows through it.
 - **Bridge**: `subscriber.py`, long-running on this machine. Subscribes to the
   broker, writes everything to `telemetry.log`. Holds the broker credential

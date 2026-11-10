@@ -1,6 +1,6 @@
 # Watcher System Operations Manual (RUNBOOK)
 
-**Last updated:** 2026-10-06
+**Last updated:** 2026-11-10
 **Purpose:** The definitive operations manual for the Watcher bench — build systems, command paths, MQTT infrastructure, SPI link, and every bench capability. Written because the assistant kept forgetting bench capabilities (e.g. `himax_at` is page-side in `watcher-console.html`, not S3 firmware). Read this before doing bench work.
 
 ---
@@ -67,7 +67,7 @@ grep -a "DIAG watcher-himax" telemetry.log | tail -1  # Himax version
 | Source | `~/workspace/projects/watcher-input-assistant/firmware/` |
 | Toolchain | ESP-IDF v5.3 — **not on default PATH** |
 | Version file | `firmware/main/main.c` → `#define FW_VERSION "x.y.z"` |
-| Current | `0.4.18.35` |
+| Current | `0.4.51` |
 
 ```bash
 # Environment setup (REQUIRED in each new shell)
@@ -97,7 +97,7 @@ sha256sum ~/workspace/your_files/himax-flash-kit/v0.4.18.35/watcher_s3_0.4.18.35
 | Source | `~/workspace/projects/watcher-input-assistant/sscma-fork/sscma-example-we2-main/` |
 | Toolchain | ARM GNU 13.2 — **not on default PATH** |
 | Version file | `EPII_CM55M_APP_S/library/sscma_micro/sscma/server/at/callback/watcher_build_hash.h` → `#define WATCHER_FW_ID "watcher-himax-x.y.z-spi"` |
-| Current | `0.4.20.39` |
+| Current | `0.4.20.62` |
 
 ```bash
 # Environment setup (REQUIRED in each new shell)
@@ -105,8 +105,7 @@ export PATH=~/workspace/arm-gnu-toolchain-13.2.Rel1-x86_64-arm-none-eabi/bin:$PA
 
 # Build — the makefile is in EPII_CM55M_APP_S/, NOT the top level!
 cd ~/workspace/projects/watcher-input-assistant/sscma-fork/sscma-example-we2-main/EPII_CM55M_APP_S
-touch <changed-source>.cpp   # make doesn't always detect changes — touch first!
-make -j$(nproc)
+make cleanbuild   # REQUIRED for every build: regenerates the build fingerprint + full clean
 
 # Package secure image — CRITICAL: copy the FRESH ELF first
 # (the generator silently packages a stale ELF otherwise)
@@ -118,24 +117,24 @@ cd we2_image_gen_local
 
 # Verify the version string is the NEW one (catches stale builds)
 strings output_case1_sec_wlcsp/output.img | grep "watcher-himax-"
-# MUST show watcher-himax-0.4.20.39-spi (or whatever you just built)
+# MUST show watcher-himax-0.4.20.62-spi (or whatever you just built)
 
 # Stage for delivery
-mkdir -p ~/workspace/your_files/himax-flash-kit/v0.4.20.39
-cp output_case1_sec_wlcsp/output.img ~/workspace/your_files/himax-flash-kit/v0.4.20.39/watcher_sscma_v0.4.20.39_spi.img
-sha256sum ~/workspace/your_files/himax-flash-kit/v0.4.20.39/watcher_sscma_v0.4.20.39_spi.img
+mkdir -p ~/workspace/your_files/himax-flash-kit/v0.4.20.62
+cp output_case1_sec_wlcsp/output.img ~/workspace/your_files/himax-flash-kit/v0.4.20.62/watcher_sscma_v0.4.20.62_spi.img
+sha256sum ~/workspace/your_files/himax-flash-kit/v0.4.20.62/watcher_sscma_v0.4.20.62_spi.img
 ```
 
 **Critical lessons:**
-- **Stale builds are the #1 Himax pitfall.** `0.4.20.31` was delivered with 100ms-timeout code despite source saying 2500µs — `make` didn't recompile. Always `touch` the changed `.cpp` before `make`. Always verify with `strings` on the ELF *and* the packaged image.
-- **The 16-char boot fingerprint is stale/non-unique** (e.g. `bdb53f70a364ed94` appears across versions). The `watcher-himax-x.y.z-spi` string is the reliable version indicator. Check the DIAG line's version string, ignore the fingerprint.
-- Clean rebuild: `make clean && make -j$(nproc)` (takes ~9 minutes — full TensorFlow Lite rebuild).
+- **Stale builds are the #1 Himax pitfall.** `0.4.20.31` was delivered with 100ms-timeout code despite source saying 2500µs — `make` didn't recompile. Always build with `make cleanbuild` (the tree's header dependency tracking is broken; partial rebuilds have repeatedly shipped stale objects). Always verify with `strings` on the ELF *and* the packaged image.
+- **The boot fingerprint is generated, not hardcoded** (since 2026-10-08): `gen_build_hash.sh` derives `WATCHER_BUILD_HASH` from the key sources on every build. If the fingerprint matches a previous build, the build is stale — rebuild with `make cleanbuild`. Verify BOTH the `watcher-himax-x.y.z-spi` string and the fingerprint against the build report.
+- Clean rebuild: `make cleanbuild` (takes ~9 minutes — full TensorFlow Lite rebuild; also regenerates the fingerprint).
 
 ### 2.3 Version rules (John, standing)
 
 - **Every distinct binary gets a unique version.** Never mint two different binaries with the same version — "a version number is a promise that one exact artifact is running."
 - Hotfix = patch bump (e.g. `0.4.18` → `0.4.18.1`). Bad builds keep their numbers so history stays trackable ("name it 0.4.1 so we can track the bad build").
-- Format: S3 `0.4.18.x`, Himax `0.4.20.x`.
+- Format: S3 `0.4.x`, Himax `0.4.20.x`.
 
 ---
 
@@ -319,7 +318,7 @@ Key material: commander `muse-01` keys at `~/.ssh/watcher_seal_*` (0600). Never 
 ### 5.6 Console page
 
 - `watcher-console.html` — single self-contained file, served by John locally (his own webserver per his preference).
-- Version shown in Setup tab and `watcher/status` (`page=0.4.140`). Check it's current before debugging page behavior.
+- Version shown in Setup tab and `watcher/status` (`page=...`; current 0.4.190). Check it's current before debugging page behavior.
 - `himax_at` / `himax_at_batch` live here (page-side, direct USB UART to Himax).
 - After console changes: export → `~/workspace/your_files/watcher-console/watcher-console.html` → John downloads + hard-refreshes.
 
@@ -460,7 +459,7 @@ Don't re-derive these — they exist:
 | **0.4.20.39** | **MISO-flag, clean rebuild** | `8ae7d341…` |
 
 ### Bench pairing
-- **Current:** S3 `0.4.18.35` + Himax `0.4.20.39`
+- **Current:** S3 `0.4.51` + Himax `0.4.20.62`
 
 ---
 

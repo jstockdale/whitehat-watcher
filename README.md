@@ -244,6 +244,17 @@ transport. Everything project-specific lives in that fork:
 - `AT+SPIDUMP`, the capture-and-stage command behind the SPI bulk
   frame pull;
 - the signal-driven RX re-arm gate and the parser scan-realignment;
+- `AT+CROP` sensor windowing (0.4.20.61): a 1:1 crop window into
+  the full sensor frame, served by the same AT server. Its first
+  live test found an ENOMEM failure — `setCropWindow` allocated a
+  second 1.26 MB capture buffer — fixed by reusing the persistent
+  buffer and validated the same day (1296×972 center crop and a
+  2592×486 full-width strip, exact sizes both);
+- transport self-defense (0.4.20.62): an arm-failure flag with
+  re-arm retry, a GPIO readback proving the receiver is actually
+  armed (pin muxed and driven, not just DMA outstanding), a
+  stuck-unarmed watchdog, and poll-gap diagnostics in the DIAG
+  line — the Himax half of the link-hardening round (see *Status*);
 - build fingerprinting: `WATCHER_BUILD_HASH`, generated from the key
   sources by `gen_build_hash.sh` and printed at boot, so the running
   artifact can be identified unambiguously.
@@ -263,7 +274,7 @@ Customizing it further follows the shape those changes established:
   reports the live mode. Host code never hardcodes preset IDs, so a
   Himax-side table change doesn't silently break the S3.
 - **Versioning is two lines, deliberately.** Himax builds carry
-  their own version (current: 0.4.20.60) independent of the S3's
+  their own version (current: 0.4.20.62) independent of the S3's
   0.4.x line, and the boot print pairs it with the build
   fingerprint. Trust the fingerprint, not the filename.
 
@@ -346,9 +357,18 @@ chain, and mode/touch/wheel/wake-word input components. Highlights:
   host acknowledgements — per-chunk CRC32, nack-triggered resend,
   baud-aware timeouts — so a transfer degrades loudly instead of
   shipping a hole.
+- **Link hardening** (0.4.50–0.4.51): the S3↔Himax link heals
+  itself instead of wedging. A supervisor escalates — drain,
+  protocol reset, Himax reset pulse, power-rail cycle — with
+  backoff and an hourly rail cap, and never reboots the S3 over a
+  slow peripheral. Every heartbeat carries a nested `himax_link`
+  object (link state, failure streak, per-rung recovery credits),
+  so link health is visible in the ordinary telemetry stream. The
+  round grew out of a full-log root-cause of the link wedge and a
+  soak that exposed a second failure shape — see *Status*.
 - **Negotiated serial baud** (landed): the console link boots at
   115200 always, then negotiates up with round-trip confirmation and
-  automatic fallback. The CH9102 bridge tops out at a measured,
+  automatic fallback. The CH342 bridge chip tops out at a measured,
   reproduced **750000** baud (107/107 clean); 921600 garbles from
   bridge-chip phase hunting, and 576000/691200/806400 are host-side
   dead zones. Design: `docs/baud-negotiation-design-2026-11-03.md`.
@@ -402,60 +422,95 @@ measured re-baseline that overturned its own earlier theory),
 by phase), `docs/chunk-loss-rca-2026-11-02.md`,
 `docs/bridge-reassembler-design-2026-11-02.md`,
 `docs/sd-capture-audit-design-2026-11-02.md`,
-`docs/baud-negotiation-design-2026-11-03.md`, and
+`docs/baud-negotiation-design-2026-11-03.md`,
 `docs/mic-audit-2026-11-07.md` (how a microphone stays silent for two
-months with every digital register correct).
+months with every digital register correct),
+`docs/link-wedge-rca-2026-11-09.md` (the wedge census, the flap
+storm, and the hardening round they produced), and
+`docs/audio-verification-offline-2026-11-09.md` (the streaming
+audio reassemblers, verified byte-identical offline).
 
 ## Status
 
-**Working and bench-validated** (S3 firmware 0.4.48 + Himax firmware
-0.4.20.60, console 0.4.188): BLE HID input; eyes-on-screen capture
-with byte-exact frame delivery; the SPI bulk path at ~4 s (from
-35.7 s) with zero CRC failures; sealed command control with
-device-side verification; negotiated serial baud (750000 top rung);
-ack'd chunk streaming; and the **complete voice loop** — wake word
-or push-to-talk in, transcription on the host, the answer rendered
-back on the device's screen. The console + bridge toolchain is the
-daily driver for all of it. Still on the list: the formal 20-frame
-soak for the SPI work (validation so far: 160 link tests, 923+ bulk
-commands, multiple full frames).
+**Working and bench-validated** (S3 firmware 0.4.51 + Himax firmware
+0.4.20.62, console 0.4.190): BLE HID input; eyes-on-screen capture
+with byte-exact frame delivery, including 1:1 crop windows into
+the full sensor frame; the SPI bulk path at ~4 s (from 35.7 s)
+with zero CRC failures; sealed command control with device-side
+verification; negotiated serial baud (750000 top rung); ack'd
+chunk streaming; and the **complete voice loop** — wake word or
+push-to-talk in, transcription on the host, the answer rendered
+back on the device's screen. The console + bridge toolchain is
+the daily driver for all of it. (Validation so far: 160 link
+tests, 923+ bulk commands, multiple full frames.)
 
-**Known issue (root-caused, fix in 0.4.49):** an interrupt-watchdog
-panic in the legacy I2C path recurred across 0.4.40–0.4.48 (five
-sightings, always during quiet wake-word listening, always with
-clean recovery). Symbolizing the panic backtrace against the build
-established the chain: the vendor IO-expander driver's read cache
-never engages on a part configured without an interrupt pin, so the
-10 ms wheel-button poll was issuing a real I2C transaction
-~100 times a second; a rare bus timeout then dropped the legacy
-driver into its FSM-reset path, which occasionally spun in ISR
-context past the interrupt watchdog. The fix samples the button at
-50 ms with a failure backoff and runs I2C0 at 100 kHz instead of
-400 kHz. (The watchdogs stay enabled — a watchdog firing on a hang
-is correct behavior.) Full record:
+**Fixed in 0.4.49:** an interrupt-watchdog panic in the legacy I2C
+path recurred across 0.4.40–0.4.48 (five sightings, always during
+quiet wake-word listening, always with clean recovery).
+Symbolizing the panic backtrace against the build established the
+chain: the vendor IO-expander driver's read cache never engages
+on a part configured without an interrupt pin, so the 10 ms
+wheel-button poll was issuing a real I2C transaction ~100 times
+a second; a rare bus timeout then dropped the legacy driver into
+its FSM-reset path, which occasionally spun in ISR context past
+the interrupt watchdog. The fix samples the button at 50 ms with
+a failure backoff and runs I2C0 at 100 kHz instead of 400 kHz; a
+follow-on stack overflow in the `dbg png` path was fixed in
+0.4.49.1. (The watchdogs stay enabled — a watchdog firing on a
+hang is correct behavior.) Full record:
 `docs/i2c-isr-wdt-investigation-prep-2026-11-08.md`.
+
+**The link-hardening round (fixes live; acceptance in progress):**
+the S3↔Himax link could wedge with the MISO handshake gate stuck
+HIGH — a state every S3 receive path hard-gated on, retried
+forever with no counter, backoff, or escalation. A
+2.58-million-line log census found the signature present since
+October 2026: a long-standing latent hole, not a regression
+(`docs/link-wedge-rca-2026-11-09.md`). 0.4.50 shipped the
+self-healing escalation ladder and the `himax_link` heartbeat
+telemetry; the acceptance soak then exposed a second morphology
+— a self-sustaining **gate flap storm** (~300 ms period, hours
+long) that starved long transfers while short exchanges squeezed
+through. A line-by-line audit of both firmwares found why the
+ladder never engaged (its failure counter reset on any partial
+success, so the streak could never reach a rung) and why the new
+telemetry had never been seen (it sat past the bridge log's
+truncation point). 0.4.51 fixes the accounting and the telemetry
+placement; Himax 0.4.20.62 added its own arm/readback/watchdog
+guards. The hardened pair is live on the bench, and the recovery
+path is proven — a sealed `eyes_reset` cleared the storm with no
+S3 reboot. Remaining acceptance steps: a dead-Himax drain test, a
+UART capture to settle one open Himax-side hypothesis, and the
+20-cycle soak re-run.
 
 **Next, in order:**
 
-1. **Streaming audio shipping** (built in 0.4.49, in verification):
-   a take used to be captured in full, then sent — with no flow
-   control, so chunks could be lost in transit. 0.4.49 puts a PSRAM
-   ring buffer between capture and a dedicated sender task so sends
-   overlap capture; streamed chunks carry their chunk total only on
-   the final chunk, and the bridge and console reassemblers were
-   updated to match. (Extending the image path's ack gate to audio
-   is the follow-on candidate.)
-2. **Native Wi-Fi MQTT (Track B)**: the device on the broker
+1. **Link-hardening acceptance**: the dead-Himax drain test, the
+   FH-2 UART capture, Himax 0.4.20.63 (a pad-stuck-high watchdog
+   and wider arm verification), and the 20-cycle soak re-run on
+   the hardened pair.
+2. **Streaming audio bench proof**: a take used to be captured in
+   full, then sent — with no flow control, so chunks could be
+   lost in transit. 0.4.49 puts a PSRAM ring buffer between
+   capture and a dedicated sender task so sends overlap capture;
+   streamed chunks carry their chunk total only on the final
+   chunk, and the bridge and console reassemblers were updated to
+   match. The three implementations are verified byte-identical
+   offline (`docs/audio-verification-offline-2026-11-09.md`); the
+   live voice proof on the bench is the remaining step.
+   (Extending the image path's ack gate to audio is the follow-on
+   candidate.)
+3. **Native Wi-Fi MQTT (Track B)**: the device on the broker
    directly, alongside — not instead of — the tethered mode. First
    the mirror-queue fix (bounded-blocking enqueue + drop counter)
    so image bytes can never be silently dropped, then chunks bypass
    the serial ring entirely when native is up.
-3. **SD capture audit log** (designed): every capture — PNG and
+4. **SD capture audit log** (designed): every capture — PNG and
    audio — also lands on the device's SD card with an append-only
    index, as the device-side source of truth behind the console's
    privacy log. A full card stops auditing and says so; it never
    silently overwrites.
-4. Encode-CPU trims (Track C) once both transports land and the CPU
+5. Encode-CPU trims (Track C) once both transports land and the CPU
    becomes the wall.
 
 ## Hardware notes
