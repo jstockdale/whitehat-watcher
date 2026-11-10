@@ -28,6 +28,23 @@ behavior). A resync failure never blocks a send: it warns and seals
 from the persisted counter. The manual --resync stays for forensics,
 and --auto-resync runs the same path once, verbosely.
 
+REPLAY-REACTIVE RESYNC (2026-11-09, spec:
+docs/seal-replay-reactive-resync-spec-2026-11-09.md, margin ruled by
+John): the advertised floor is the device's persisted/boot floor,
+but its LIVE high-water can run ahead of it — the console page seals
+the same muse-01 key from its own counter store, and a crash-reboot
+moves the persisted floor by the NVS stride. When that happens the
+device says so in plain text: `SEAL: REPLAY ctr <sent> <= <live>`,
+naming the live high-water. auto_resync() therefore takes the
+binding floor as max(advertised floor, latest REPLAY high-water),
+and when the REPLAY candidate binds it resyncs to live +
+REPLAY_MARGIN (the page may seal again between our scan and our
+send). A dropped command is still lost — the device gives no retry
+signal — but the next send heals itself: one drop per desync event
+instead of silent drops until a human reads the log. resync_counter
+stays forward-only, so a stale REPLAY line can never drag the
+counter down.
+
 Key material lives in ~/.ssh/ (0600). The counter lives in
 ~/.ssh/watcher_seal_ctr and is fsync'd on every increment.
 """
@@ -107,6 +124,33 @@ TELEMETRY_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "telemetry.log")
 FLOOR_MAX_AGE_S = 120        # log mtime fresher than this = bridge alive
 _FLOOR_RE = re.compile(r'"seal_floor"\s*:\s*(\d+)')
+_REPLAY_RE = re.compile(r"SEAL:\s*REPLAY\s+ctr\s+(\d+)\s*<=\s*(\d+)")
+REPLAY_MARGIN = 128          # headroom over a REPLAY-named high-water
+
+
+def _telemetry_tail(log_path=TELEMETRY_LOG, max_age_s=FLOOR_MAX_AGE_S):
+    """Freshness-gated tail read shared by the floor estimators.
+
+    Returns the decoded tail text, or None when the log is missing
+    or stale. Freshness is gated on the log file's mtime (filesystem
+    truth, timezone-free): a bridge that has stopped writing has no
+    fresh word from the device. The log's line timestamps are
+    deliberately NOT compared against the local clock — the
+    subscriber stamps in UTC while this host's wall clock is local,
+    and any fixed assumption about either breaks silently.
+    """
+    try:
+        st = os.stat(log_path)
+    except OSError:
+        return None
+    if time.time() - st.st_mtime > max_age_s:
+        return None
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(max(0, st.st_size - (16 << 20)))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
 
 
 def latest_telemetry_floor(log_path=TELEMETRY_LOG,
@@ -126,45 +170,66 @@ def latest_telemetry_floor(log_path=TELEMETRY_LOG,
       * floors are monotonic — every reported value is a lower bound
         on the current floor, so the max is the best estimator and
         can never overshoot the device's true floor.
-    Freshness is gated on the log file's mtime (filesystem truth,
-    timezone-free): a bridge that has stopped writing has no fresh
-    word from the device. The log's line timestamps are deliberately
-    NOT compared against the local clock — the subscriber stamps in
-    UTC while this host's wall clock is local, and any fixed
-    assumption about either breaks silently.
     """
-    try:
-        st = os.stat(log_path)
-    except OSError:
-        return None
-    if time.time() - st.st_mtime > max_age_s:
-        return None
-    try:
-        with open(log_path, "rb") as f:
-            f.seek(max(0, st.st_size - (16 << 20)))
-            tail = f.read().decode("utf-8", "replace")
-    except OSError:
+    tail = _telemetry_tail(log_path, max_age_s)
+    if tail is None:
         return None
     floors = [int(m.group(1)) for m in _FLOOR_RE.finditer(tail)]
     return max(floors) if floors else None
 
 
+def latest_replay_highwater(log_path=TELEMETRY_LOG,
+                            max_age_s=FLOOR_MAX_AGE_S):
+    """Live high-water named by the most recent SEAL REPLAY line.
+
+    When a sealed command is dropped as a replay, the device log
+    says so in plain text — `SEAL: REPLAY ctr <sent> <= <live>` —
+    and <live> is the verifier's live high-water at that moment,
+    which can run ahead of every telemetry-advertised floor (the
+    page seals the same key from its own counter store; a
+    crash-reboot moves the persisted floor by the NVS stride).
+    The most recent line in the tail wins: the high-water is
+    monotonic, so the freshest report is the tightest lower bound.
+    Returns None when the tail holds no REPLAY line (or the log
+    is missing/stale, via the shared freshness gate).
+    """
+    tail = _telemetry_tail(log_path, max_age_s)
+    if tail is None:
+        return None
+    lives = [int(m.group(2)) for m in _REPLAY_RE.finditer(tail)]
+    return lives[-1] if lives else None
+
+
 def auto_resync(log_path=TELEMETRY_LOG):
     """Forward-only resync from the freshest telemetry floor.
 
-    Returns (own_before, applied_floor) when the counter moved,
-    (own, own) when already ahead, or None when no fresh floor is
-    available. Raises ValueError only from resync_counter's
+    The binding floor is max(advertised floor, latest REPLAY
+    high-water) over whichever estimators have fresh data. When
+    the REPLAY candidate binds, the target is live + REPLAY_MARGIN
+    (the page may seal again between this scan and our next send;
+    a bare live + 1 would just eat the next drop too). When the
+    advertised floor binds, the target is the floor itself, exactly
+    the pre-REPLAY-reactive behavior.
+
+    Returns (own_before, target, source) with source "advertised"
+    or "replay"; target <= own_before when the counter was already
+    ahead (no move made). Returns None when neither estimator has
+    fresh data. Raises ValueError only from resync_counter's
     anti-oracle refusal — callers decide whether that is fatal.
     """
-    floor = latest_telemetry_floor(log_path)
-    if floor is None:
+    advertised = latest_telemetry_floor(log_path)
+    replay = latest_replay_highwater(log_path)
+    if advertised is None and replay is None:
         return None
+    if replay is not None and (advertised is None or replay > advertised):
+        target, source = replay + REPLAY_MARGIN, "replay"
+    else:
+        target, source = advertised, "advertised"
     own = read_counter()
-    if floor <= own:
-        return (own, own)
-    resync_counter(floor)
-    return (own, floor)
+    if target <= own:
+        return (own, target, source)
+    resync_counter(target)
+    return (own, target, source)
 
 
 def seal_command(cmd_id, cmd, topic="watcher/command"):
@@ -191,7 +256,8 @@ def seal_command(cmd_id, cmd, topic="watcher/command"):
     out = {"sealed": base64.b64encode(env).decode("ascii"),
            "ctr": ctr, "ts_ms": ts_ms}
     if synced is not None:
-        out["resync"] = {"from": synced[0], "floor": synced[1]}
+        out["resync"] = {"from": synced[0], "floor": synced[1],
+                         "source": synced[2]}
     return out
 
 
@@ -207,23 +273,21 @@ if __name__ == "__main__":
         sys.exit(0)
     # --auto-resync: run the seal_command() floor sync once, verbosely.
     if len(sys.argv) == 2 and sys.argv[1] == "--auto-resync":
-        floor = latest_telemetry_floor()
-        if floor is None:
-            print("no fresh seal_floor in telemetry.log "
-                  "(bridge down or device silent); counter unchanged "
-                  "at %d" % read_counter())
-            sys.exit(0)
         try:
             r = auto_resync()
         except ValueError as e:
             print("auto-resync refused: %s" % e, file=sys.stderr)
             sys.exit(1)
-        if r is not None and r[1] > r[0]:
-            print("counter resynced %d -> %d (telemetry floor)"
-                  % (r[0], r[1]))
+        if r is None:
+            print("no fresh seal_floor in telemetry.log "
+                  "(bridge down or device silent); counter unchanged "
+                  "at %d" % read_counter())
+        elif r[1] > r[0]:
+            print("counter resynced %d -> %d (telemetry floor, "
+                  "source=%s)" % (r[0], r[1], r[2]))
         else:
             print("counter %d already >= telemetry floor %d; no move"
-                  % (read_counter(), floor))
+                  % (read_counter(), r[1]))
         sys.exit(0)
     print("usage: seal_client.py --resync <floor> | --auto-resync",
           file=sys.stderr)

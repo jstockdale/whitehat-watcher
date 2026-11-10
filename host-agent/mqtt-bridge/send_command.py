@@ -63,7 +63,13 @@ TOPIC_PREFIX = os.environ.get("MQTT_TOPIC") or "watcher"
 DBG_ALLOWED = {"version", "mem", "heap", "tasks", "pwr", "i2c",
                "touch", "wheel", "pointer", "spitest",
                "eyes", "at", "snaptest", "png", "crop", "strip",
-               "wakeword", "codec", "loopback", "rings"}
+               "wakeword", "codec", "loopback", "rings",
+               # eyes_reset: Himax link recovery (RST pulse; "rail":1
+               # also cycles the rail). dbg subcommand since fw v0.4.3;
+               # remote use requires a sealed envelope per the fw
+               # 0.4.50 policy, rail defaults to 0 remotely (John's
+               # link-hardening slate, 2026-11-09).
+               "eyes_reset"}
 
 # HID input class: approved by John 2026-09-23 for the eyes-drive-cursor
 # loop. Standing rule: NEVER send one without his explicit per-use
@@ -93,6 +99,18 @@ def allowed(cmd) -> bool:
                 and isinstance(n, int) and not isinstance(n, bool)
                 and 1 <= n <= 100)
     if t == "dbg":
+        if cmd.get("cmd") == "eyes_reset":
+            # v0.4.51 (G3, host half): eyes_reset gets its own branch so
+            # rail is shape-checked here, not just on the device: keys
+            # must be a subset of {t,cmd,rail} and rail (when present)
+            # a strict int 0 or 1 — bool excluded explicitly (Python
+            # bool IS an int subclass; True would otherwise pass as 1).
+            # The device re-checks (rail=1 only for the JSON number 1).
+            return (set(cmd.keys()) <= {"t", "cmd", "rail"}
+                    and (cmd.get("rail") is None
+                         or (isinstance(cmd.get("rail"), int)
+                             and not isinstance(cmd.get("rail"), bool)
+                             and cmd.get("rail") in (0, 1))))
         if cmd.get("cmd") == "wakeword":
             # wakeword is the one state-changing dbg subcommand: its
             # whole job is the on/off toggle (John-approved for the
