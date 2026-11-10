@@ -108,6 +108,12 @@ class AudioReassembler:
             seq = int(msg.get("seq", 0))
             raw_total = msg.get("total")
             total = int(raw_total) if raw_total is not None else None
+            if total is not None and total <= 0:
+                # A non-positive total is no total at all (console
+                # parity: privacyAudioChunk accepts only total > 0).
+                # total=0 would otherwise satisfy len(chunks) >= total
+                # on chunk 0 and split the take into fragments.
+                total = None
             try:
                 raw = base64.b64decode(msg.get("data", ""))
             except Exception:
