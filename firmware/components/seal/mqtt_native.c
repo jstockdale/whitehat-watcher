@@ -57,7 +57,7 @@
 
 /* link.h is deliberately NOT #included (one-directional build DAG:
  * link.c #includes this component's headers, never the reverse). */
-extern void link_sealed_dispatch(const char *json, size_t len);
+extern void link_sealed_dispatch(const char *json, size_t len, bool verified);
 extern void link_set_tx_mirror(void (*cb)(const char *line, size_t len));
 
 static const char *TAG = "mqtt_native";
@@ -299,7 +299,9 @@ static void dispatch_verified_body(const uint8_t *body, size_t blen)
     s = cJSON_PrintUnformatted(inner);
     cJSON_Delete(inner);
     if (s) {
-        link_sealed_dispatch(s, strlen(s));
+        /* v0.4.50: this body came out of a seal_dev-verified envelope
+         * (both callers verify first) — dispatch as _sealed. */
+        link_sealed_dispatch(s, strlen(s), true);
         free(s);
     }
 }
@@ -379,8 +381,9 @@ static void process_inbound(const uint8_t *data, size_t len,
         native_tel_err("plain", "strict: unsealed command rejected");
         return;
     }
-    /* Grace: plain JSON command from the topic. */
-    link_sealed_dispatch(js, len);
+    /* Grace: plain JSON command from the topic. v0.4.50: dispatched
+     * UNVERIFIED — tagged _via_mqtt but never _sealed. */
+    link_sealed_dispatch(js, len, false);
     free(js);
 }
 

@@ -21,6 +21,31 @@ bool eyes_ready(void);
  * link_up, not just ready. */
 bool eyes_link_up(void);
 
+/* v0.4.50 (link hardening WI-3): link generation counter. Incremented
+ * every time Himax session state is lost and re-established (successful
+ * eyes_recover_camera, successful reboot re-link handshake). Callers
+ * that issue Himax state commands (e.g. crop) snapshot the generation
+ * before the call; a changed generation after a timeout means the
+ * command may have died with the old session and can be re-issued. */
+uint32_t eyes_link_gen(void);
+
+/* v0.4.50 (link hardening WI-1/WI-3): snapshot of Himax link health for
+ * the heartbeat's nested himax_link object. Counters are since boot.
+ * state: "up" (answering), "down" (gate failing), "recovering" (the
+ * supervisor is running a ladder rung). last_rung: the rung credited
+ * with the most recent recovery ("drain"|"reset"|"rst"|"rail"|"none"). */
+typedef struct {
+    const char *state;
+    uint32_t streak;
+    uint32_t gen;
+    uint32_t rec_drain;
+    uint32_t rec_reset;
+    uint32_t rec_rst;
+    uint32_t rec_rail;
+    const char *last_rung;
+} eyes_himax_link_info_t;
+void eyes_himax_link_info(eyes_himax_link_info_t *out);
+
 /** IO expander handle created by eyes_init() (NULL before init or when the
  *  expander isn't reachable). Shared with the display component, which uses
  *  it to switch the LCD power rail. */

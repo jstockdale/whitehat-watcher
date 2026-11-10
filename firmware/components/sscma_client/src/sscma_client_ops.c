@@ -211,11 +211,18 @@ static void sscma_client(void *arg)
     char *prefix = NULL;
     sscma_client_handle_t client = (sscma_client_handle_t)arg;
     sscma_client_reply_t reply;
+    /* v0.4.50 (WI-1): poll backoff. The healthy interval is unchanged
+     * (1 ms); consecutive available() failures step the delay up the
+     * ladder 1 -> 10 -> 50 -> 250 ms so a wedged link is polled ~4x/s
+     * instead of ~20x/s. Any successful poll returns to 1 ms. */
+    static const uint16_t poll_backoff_ms_[4] = {1, 10, 50, 250};
+    int poll_fail_idx_ = 0;
+    uint32_t poll_summary_bucket_ = 0;
     while (true)
     {
         /* Phase 1 (v0.4.14): 1 ms AT poll interval (was 10 ms). Bulk
          * transfers use sscma_client_read_bulk() and bypass this loop. */
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(pdMS_TO_TICKS(poll_backoff_ms_[poll_fail_idx_]));
         if (client->inited == false)
         {
             continue;
@@ -227,7 +234,39 @@ static void sscma_client(void *arg)
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        if (sscma_client_available(client, &rlen) == ESP_OK && rlen)
+        esp_err_t avail_ret = sscma_client_available(client, &rlen);
+        if (avail_ret != ESP_OK)
+        {
+            if (poll_fail_idx_ < 3)
+            {
+                poll_fail_idx_++;
+            }
+            /* v0.4.51 (G2): one summary line per +100 of the MONOTONIC
+             * io failure total while failures continue. Re-keyed from
+             * the consecutive streak (which a flap pins at 3, so the
+             * old line could never fire in flap mode) and the bucket
+             * no longer resets on success (the total is monotonic; a
+             * bucket reset on every success was the second defeat). */
+            uint32_t streak = sscma_client_gate_streak();
+            uint32_t window = sscma_client_gate_failures_window();
+            uint32_t total = sscma_client_gate_failures_total();
+            if ((streak > 0 || window > 0) &&
+                total / 100 > poll_summary_bucket_)
+            {
+                poll_summary_bucket_ = total / 100;
+                ESP_LOGW(TAG, "himax gate still failing, streak=%u "
+                         "window60=%u total=%u drains=%u discarded=%u",
+                         (unsigned)streak, (unsigned)window,
+                         (unsigned)total,
+                         (unsigned)sscma_client_gate_drain_recoveries(),
+                         (unsigned)sscma_client_gate_drain_discards());
+            }
+        }
+        else
+        {
+            poll_fail_idx_ = 0;
+        }
+        if (avail_ret == ESP_OK && rlen)
         {
             if (rlen + client->rx_buffer.pos > client->rx_buffer.len)
             {
@@ -952,6 +991,12 @@ esp_err_t sscma_client_write(sscma_client_handle_t client, const void *data, siz
 esp_err_t sscma_client_available(sscma_client_handle_t client, size_t *ret_avail)
 {
     return sscma_client_io_available(client->io, ret_avail);
+}
+
+/* v0.4.50 (WI-3): bulk-owns-the-bus flag for the eyes supervisor. */
+bool sscma_client_bulk_active(sscma_client_handle_t client)
+{
+    return client && client->bulk_active;
 }
 
 esp_err_t sscma_client_register_callback(sscma_client_handle_t client, const sscma_client_callback_t *callback, void *user_ctx)

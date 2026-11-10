@@ -216,6 +216,7 @@ typedef enum {
     SPI_TXN_READ,        // Read N bytes (AT response)
     SPI_TXN_WRITE,       // Write AT command
     SPI_TXN_BULK,        // Full bulk transfer: START→READ_CRC×N→STOP (atomic)
+    SPI_TXN_RESYNC,      // v0.4.50: no-gate CMD_RESET resync (ladder rung 2)
 } spi_txn_type_t;
 
 #define SPI_TXN_POOL_SIZE 8
@@ -260,6 +261,15 @@ typedef struct
      * to PSRAM eliminates the per-transaction allocation. Sized to
      * spi_trans_max_bytes (the loop below never exceeds it per chunk). */
     uint8_t *dma_stage;
+    /* v0.4.50 (link hardening WI-3): rung-1 drain hand-off stash. When an
+     * AVAILABLE poll fails its gate and the drain clocks out a staged
+     * response, the bytes land here; the poll reports them as its count
+     * and the next read serves them before clocking anything. The SPI
+     * stream is strictly sequential, so the stash is always exactly the
+     * head of what that read would have clocked. PSRAM, CPU-only. */
+    uint8_t *drain_stash;
+    size_t drain_stash_len;   /* valid bytes in the stash */
+    size_t drain_stash_pos;   /* bytes already served to readers */
     /* v0.4.18.49: Flag to prevent background AT polling during spitest.
      * The spitest drives the SPI bus directly; if the background process
      * task calls available() and sees HIGH (test pattern ready), it will
@@ -282,6 +292,8 @@ static esp_err_t spi_txn_available_exec(sscma_client_io_spi_t *spi_client_io, si
 static esp_err_t spi_txn_read_exec(sscma_client_io_spi_t *spi_client_io, void *buf, size_t len);
 static esp_err_t spi_txn_write_exec(sscma_client_io_spi_t *spi_client_io, const void *buf, size_t len);
 static esp_err_t spi_txn_bulk_exec(sscma_client_io_spi_t *spi_client_io, void *buf, size_t len);
+static esp_err_t spi_txn_resync_exec(sscma_client_io_spi_t *spi_client_io);
+static esp_err_t spi_send_cmd_no_gate_(sscma_client_io_spi_t *spi_client_io, uint8_t cmd, uint16_t len);
 
 esp_err_t sscma_client_new_io_spi_bus(sscma_client_spi_bus_handle_t bus, const sscma_client_io_spi_config_t *io_config, sscma_client_io_handle_t *ret_io)
 {
@@ -364,6 +376,12 @@ esp_err_t sscma_client_new_io_spi_bus(sscma_client_spi_bus_handle_t bus, const s
     ESP_GOTO_ON_FALSE(spi_client_io->dma_stage, ESP_ERR_NO_MEM, err, TAG,
                       "no DMA mem for rx staging buffer");
 
+    /* v0.4.50: drain hand-off stash (see struct comment). */
+    spi_client_io->drain_stash =
+        (uint8_t *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ESP_GOTO_ON_FALSE(spi_client_io->drain_stash, ESP_ERR_NO_MEM, err, TAG,
+                      "no PSRAM for drain stash");
+
     /* v0.4.18.53: Create SPI worker task queue and task.
      * v0.4.18.56 (doc verification §7): Pin worker to core 0, same as the
      * SPI ISR (isr_cpu_id in eyes.c). Avoids cross-core ISR wakeup latency. */
@@ -416,7 +434,229 @@ static esp_err_t client_io_spi_del(sscma_client_io_t *io)
     ESP_LOGD(TAG, "del spi sscma client io @%p", spi_client_io);
 
     heap_caps_free(spi_client_io->dma_stage);
+    heap_caps_free(spi_client_io->drain_stash);
     free(spi_client_io);
+    return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* v0.4.50 link hardening (WI-1/WI-2/WI-3): gate-failure accounting,    */
+/* transition-only failure logging, rung-1 drain, rung-2 resync.        */
+/*                                                                      */
+/* WI-2 counting rules (normative): the streak counts consecutive       */
+/* worker transactions that failed at a gate — never transmitted, or    */
+/* transmitted but never answered at the transport layer. Any completed */
+/* transport transaction resets it; an AT-layer error reply is a        */
+/* completed transaction (a Himax that can refuse is alive). Failure     */
+/* hooks live in the worker exec functions and in spi_send_cmd_;         */
+/* success (reset) hooks live ONLY in the exec functions (v0.4.51 D1) —  */
+/* never in the queue wrappers, which run in caller context.             */
+/*                                                                      */
+/* WI-1: gate failures log on the healthy->failing and failing->healthy */
+/* edges only (gate_note_failure_/gate_note_success_). The per-attempt   */
+/* error in spi_send_cmd_ and the per-attempt warning in                */
+/* spi_miso_wait_level_ are gone / transition-gated: the 2026-11-09     */
+/* wedge wrote ~24k lines in 21 min through the telemetry uplink.       */
+/* ------------------------------------------------------------------ */
+static volatile uint32_t gate_streak_ = 0;
+static int64_t gate_streak_start_us_ = 0;
+static volatile uint32_t gate_drain_recoveries_ = 0;
+static volatile uint32_t gate_drain_discards_ = 0;
+static uint32_t gate_failures_total_ = 0;
+/* v0.4.51 (G1): slotted trailing window over gate failures — 6 slots
+ * of 10 s. A failure increments the slot for its epoch (zeroing the
+ * slot first if it holds a stale epoch); the window value is the sum
+ * of slots whose epoch lies in the trailing 60 s. Slot quantization
+ * over-counts a failure's age by <= 10 s — the conservative direction
+ * for a failure measure. */
+#define GATE_WINDOW_SLOTS 6
+#define GATE_SLOT_MS 10000
+static uint16_t gate_window_counts_[GATE_WINDOW_SLOTS];
+static int64_t gate_window_epochs_[GATE_WINDOW_SLOTS] =
+    {-1, -1, -1, -1, -1, -1};
+static bool gate_failing_ = false;
+/* WI-1: transition flag for spi_miso_wait_level_'s timeout warning. */
+static bool miso_wait_failing_ = false;
+
+static void gate_note_failure_(void)
+{
+    if (gate_streak_ == 0) {
+        gate_streak_start_us_ = esp_timer_get_time();
+    }
+    gate_streak_++;
+    /* v0.4.51 (G1): monotonic total + trailing-window accounting. This
+     * is the single increment funnel all three failure sites pass
+     * through, so the window sees every noted failure. */
+    gate_failures_total_++;
+    {
+        int64_t epoch = (esp_timer_get_time() / 1000) / GATE_SLOT_MS;
+        unsigned slot = (unsigned)(epoch % GATE_WINDOW_SLOTS);
+        if (gate_window_epochs_[slot] != epoch) {
+            gate_window_epochs_[slot] = epoch;
+            gate_window_counts_[slot] = 0;
+        }
+        if (gate_window_counts_[slot] < 0xFFFF) {
+            gate_window_counts_[slot]++;
+        }
+    }
+    if (!gate_failing_) {
+        gate_failing_ = true;
+        ESP_LOGW(TAG, "himax gate failing: transport gate timeout "
+                      "(failure streak started)");
+    }
+}
+
+static void gate_note_success_(void)
+{
+    if (gate_failing_) {
+        gate_failing_ = false;
+        ESP_LOGI(TAG, "himax gate recovered after %u consecutive "
+                      "failure(s)", (unsigned)gate_streak_);
+    }
+    gate_streak_ = 0;
+}
+
+uint32_t sscma_client_gate_streak(void)
+{
+    return gate_streak_;
+}
+
+int64_t sscma_client_gate_streak_age_ms(void)
+{
+    if (gate_streak_ == 0 || gate_streak_start_us_ == 0) {
+        return 0;
+    }
+    return (esp_timer_get_time() - gate_streak_start_us_) / 1000;
+}
+
+uint32_t sscma_client_gate_failures_total(void)
+{
+    return gate_failures_total_;
+}
+
+uint32_t sscma_client_gate_failures_window(void)
+{
+    int64_t now_epoch = (esp_timer_get_time() / 1000) / GATE_SLOT_MS;
+    uint32_t sum = 0;
+    for (int i = 0; i < GATE_WINDOW_SLOTS; i++) {
+        int64_t e = gate_window_epochs_[i];
+        if (e >= 0 && e <= now_epoch &&
+            (now_epoch - e) < GATE_WINDOW_SLOTS) {
+            sum += gate_window_counts_[i];
+        }
+    }
+    return sum;
+}
+
+uint32_t sscma_client_gate_drain_recoveries(void)
+{
+    return gate_drain_recoveries_;
+}
+
+uint32_t sscma_client_gate_drain_discards(void)
+{
+    return gate_drain_discards_;
+}
+
+/* WI-3 rung 1: capturing variant of spi_drain_tx_. Clocks 64-byte chunks
+ * (no MOSI) until MISO falls LOW or the budget expires, COPYING what it
+ * clocks out into the io drain stash instead of discarding it. A staged
+ * AT response drained this way is the reply, not garbage (on the bulk
+ * path discarding stays correct — spi_drain_tx_ is untouched).
+ * Caller must hold the io lock and the SPI bus (spi_drain_tx_ contract).
+ * Returns the number of bytes captured (0 = nothing was staged).
+ * v0.4.51 (D2): the drain also reports HOW it exited via exit_out —
+ * the gate fell LOW (the staged FIFO emptied and the Himax re-armed),
+ * the budget expired, the stash filled, or a transmit failed. Only a
+ * gate-LOW exit can ever be declared a recovery by the caller; the
+ * other exits leave the line stuck, which is the opposite of one. */
+typedef enum {
+    DRAIN_EXIT_LOW = 0,
+    DRAIN_EXIT_TIMEOUT,
+    DRAIN_EXIT_FULL,
+    DRAIN_EXIT_XMIT,
+} drain_exit_t;
+
+#define DRAIN_STASH_CAP 4096
+#define DRAIN_CHUNK 64
+static size_t spi_drain_capture_(sscma_client_io_spi_t *spi_client_io,
+                                 uint32_t timeout_ms,
+                                 drain_exit_t *exit_out)
+{
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+    spi_transaction_t spi_trans = {};
+    size_t captured = 0;
+    drain_exit_t why = DRAIN_EXIT_LOW;
+
+    spi_client_io->drain_stash_len = 0;
+    spi_client_io->drain_stash_pos = 0;
+    while (gpio_get_level(GPIO_NUM_6) == 1) {
+        if ((xTaskGetTickCount() - start) > timeout_ticks) {
+            why = DRAIN_EXIT_TIMEOUT;
+            break;
+        }
+        if (captured >= DRAIN_STASH_CAP) {
+            why = DRAIN_EXIT_FULL; /* stash full: leave the rest staged */
+            break;
+        }
+        memset(&spi_trans, 0, sizeof(spi_trans));
+        spi_trans.length = DRAIN_CHUNK * 8;
+        spi_trans.tx_buffer = NULL;
+        spi_trans.rxlength = DRAIN_CHUNK * 8;
+        spi_trans.rx_buffer = spi_client_io->dma_stage;
+        spi_trans.user = spi_client_io;
+        if (spi_device_transmit(spi_client_io->spi_dev, &spi_trans) != ESP_OK) {
+            why = DRAIN_EXIT_XMIT;
+            break;
+        }
+        size_t room = DRAIN_STASH_CAP - captured;
+        size_t take = room < DRAIN_CHUNK ? room : DRAIN_CHUNK;
+        memcpy(spi_client_io->drain_stash + captured,
+               spi_client_io->dma_stage, take);
+        captured += take;
+        /* Brief pause to let Himax update MISO after FIFO drains
+         * (spi_drain_tx_ does the same). */
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    spi_client_io->drain_stash_len = captured;
+    if (exit_out) {
+        *exit_out = why;
+    }
+    return captured;
+}
+
+/* WI-3 rung 2 core: the RESET half of sscma_client_spi_unpark, extracted
+ * so unpark and the ladder share one implementation. Sends CMD_RESET
+ * without the LOW gate (the line is HIGH — that is the point), waits
+ * 50 ms, then waits for the Himax to re-arm (LOW) up to 100 ms. The
+ * Himax RESET handler clears both transport rings and re-arms RX.
+ * Caller must hold the io lock and the SPI bus. */
+static esp_err_t spi_transport_resync_(sscma_client_io_spi_t *spi_client_io)
+{
+    esp_err_t ret = spi_send_cmd_no_gate_(spi_client_io,
+                                          FEATURE_TRANSPORT_CMD_RESET, 0);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+    if (!spi_miso_wait_level_(0, 100, "RESET resync LOW")) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t spi_txn_resync_exec(sscma_client_io_spi_t *spi_client_io)
+{
+    xSemaphoreTake(spi_client_io->lock, portMAX_DELAY);
+    if (spi_device_acquire_bus(spi_client_io->spi_dev, portMAX_DELAY) != ESP_OK)
+    {
+        xSemaphoreGive(spi_client_io->lock);
+        return ESP_FAIL;
+    }
+    esp_err_t ret = spi_transport_resync_(spi_client_io);
+    spi_device_release_bus(spi_client_io->spi_dev);
+    xSemaphoreGive(spi_client_io->lock);
     return ret;
 }
 
@@ -427,9 +667,11 @@ static esp_err_t spi_txn_write_exec(sscma_client_io_spi_t *spi_client_io, const 
     /* v0.4.18.53: Worker executor — spi_client_io passed directly. */
     /* v0.4.18.36: MISO-flag: Wait for Himax RX-armed (MISO LOW) before sending
      * AT command via SPI. The Himax drives PB2 LOW when RX DMA is armed.
-     * v0.4.18.38: Fatal now. If timeout, Himax is down; fail fast. */
+     * v0.4.18.38: Fatal now. If timeout, Himax is down; fail fast.
+     * v0.4.50 (WI-2): the gate failure feeds the shared streak counter;
+     * the per-attempt error log is gone (transition-only, WI-1). */
     if (!spi_miso_wait_level_(0, 50, "RX-armed LOW (AT cmd)")) {
-        ESP_LOGE(TAG, "client_io_spi_write: Himax not RX-armed (MISO not LOW), failing");
+        gate_note_failure_();
         return ESP_ERR_TIMEOUT;
     }
     /* v0.4.14 (P1): 248-byte chunks with CRC16-CCITT trailer. The CRC covers
@@ -536,6 +778,11 @@ static esp_err_t spi_txn_write_exec(sscma_client_io_spi_t *spi_client_io, const 
     }
 
 err:
+    /* v0.4.50 (WI-2): a fully transmitted write is a completed transport
+     * transaction — reset the gate-failure streak. */
+    if (ret == ESP_OK) {
+        gate_note_success_();
+    }
     spi_device_release_bus(spi_client_io->spi_dev);
     xSemaphoreGive(spi_client_io->lock);
     return ret;
@@ -569,8 +816,34 @@ static esp_err_t spi_txn_read_exec(sscma_client_io_spi_t *spi_client_io, void *d
         return ESP_FAIL;
     }
 
+    /* v0.4.50 (WI-3): serve the rung-1 drain stash first. Its bytes are
+     * the head of the Himax's staged stream (see the drain_stash comment
+     * in sscma_client_io_spi_t) — exactly what this read would have
+     * clocked first. Only the remainder goes on the wire. */
+    size_t stash_take = 0;
+    if (spi_client_io->drain_stash_pos < spi_client_io->drain_stash_len) {
+        size_t staged = spi_client_io->drain_stash_len -
+                        spi_client_io->drain_stash_pos;
+        stash_take = staged < len ? staged : len;
+        memcpy(data, spi_client_io->drain_stash +
+                     spi_client_io->drain_stash_pos, stash_take);
+        spi_client_io->drain_stash_pos += stash_take;
+        if (spi_client_io->drain_stash_pos >= spi_client_io->drain_stash_len) {
+            spi_client_io->drain_stash_len = 0;
+            spi_client_io->drain_stash_pos = 0;
+        }
+        if (stash_take == len) {
+            /* Fully served from the stash. The streak reset happens
+             * exactly once, in the err: epilogue below (v0.4.51 D1) —
+             * not here: the epilogue is the exec's single ESP_OK exit
+             * discipline, shared with the wire path. */
+            goto err; /* ret == ESP_OK */
+        }
+    }
+    const size_t wire_len = len - stash_take;
+
     /* Gate 1: wait-LOW (Himax RX-armed), then send CMD_READ with length. */
-    ret = spi_send_cmd_(spi_client_io, FEATURE_TRANSPORT_CMD_READ, (uint16_t)len);
+    ret = spi_send_cmd_(spi_client_io, FEATURE_TRANSPORT_CMD_READ, (uint16_t)wire_len);
     if (ret != ESP_OK) {
         goto err;
     }
@@ -582,10 +855,10 @@ static esp_err_t spi_txn_read_exec(sscma_client_io_spi_t *spi_client_io, void *d
         goto err;
     }
 
-    /* Clock exactly len bytes. */
+    /* Clock exactly the wire remainder. */
     {
-        size_t remaining = len;
-        uint8_t *dst = (uint8_t *)data;
+        size_t remaining = wire_len;
+        uint8_t *dst = (uint8_t *)data + stash_take;
         while (remaining > 0) {
             uint16_t chunk = (remaining > spi_client_io->spi_trans_max_bytes)
                 ? spi_client_io->spi_trans_max_bytes : (uint16_t)remaining;
@@ -606,6 +879,15 @@ static esp_err_t spi_txn_read_exec(sscma_client_io_spi_t *spi_client_io, void *d
     }
 
 err:
+    /* v0.4.51 (D1): every ESP_OK exit of this exec — a wire-completed
+     * round trip or a full stash serve (whose bytes a previously
+     * completed drain of real staged content placed there) — is a
+     * completed gated transaction and resets the streak exactly once.
+     * A gate-2 timeout (the response never staged) or any other
+     * failure exit is not a completion and does not reset. */
+    if (ret == ESP_OK) {
+        gate_note_success_();
+    }
     spi_device_release_bus(spi_client_io->spi_dev);
     xSemaphoreGive(spi_client_io->lock);
     return ret;
@@ -648,12 +930,71 @@ static esp_err_t spi_txn_available_exec(sscma_client_io_spi_t *spi_client_io, si
     /* Gate 1: wait-LOW (Himax RX-armed), then send CMD_AVAILABLE. */
     ret = spi_send_cmd_(spi_client_io, FEATURE_TRANSPORT_CMD_AVAILABLE, 0);
     if (ret != ESP_OK) {
+        /* v0.4.50 (WI-3 rung 1): on a gate timeout at streak >= 3, make
+         * one bounded drain attempt (<=200 ms, not the bulk path's 2 s)
+         * while this exec still holds the io lock + bus — the drain's
+         * documented caller contract. The supervisor never retries a
+         * caller's command; this drain runs inside the caller's own
+         * transaction, which is what keeps it from ever duplicating
+         * one. Single transient timeouts (streak < 3) stay entirely on
+         * the pre-0.4.50 behaviour.
+         * v0.4.51 (D2): the capture is declared a recovery only if ALL
+         * of: the drain exited on gate LOW (the staged FIFO emptied
+         * and the Himax re-armed), the segment left after stripping
+         * the trailing idle run (a single repeated 0xFF or 0x00 — the
+         * chunk over-read guarantees up to 63 such bytes trail any
+         * real segment) is at least 2 bytes, and the count decoded
+         * from the segment's first 2 bytes fits the stash (the raw
+         * decode, no 0xFFFF special case — the fail-safe direction).
+         * A declared recovery returns the STRIPPED segment as the
+         * poll's reply and increments the recovery counter — but does
+         * NOT reset the streak (D1): the next ordinary available
+         * completion, which the cleared gate now permits, does that
+         * one poll later. Anything else is discarded wholesale: no
+         * bytes returned, none left in the stash, the discard counted,
+         * and the original timeout stands so the ladder sees an honest
+         * continuing failure. When in doubt, it is not a recovery. */
+        if (ret == ESP_ERR_TIMEOUT && sscma_client_gate_streak() >= 3) {
+            drain_exit_t why = DRAIN_EXIT_TIMEOUT;
+            size_t captured = spi_drain_capture_(spi_client_io, 200, &why);
+            size_t seg = captured;
+            if (seg > 0) {
+                uint8_t idle = spi_client_io->drain_stash[seg - 1];
+                if (idle == 0xFF || idle == 0x00) {
+                    while (seg > 0 &&
+                           spi_client_io->drain_stash[seg - 1] == idle) {
+                        seg--;
+                    }
+                }
+            }
+            uint32_t count = (seg >= 2)
+                ? (((uint32_t)spi_client_io->drain_stash[0] << 8) |
+                   (uint32_t)spi_client_io->drain_stash[1])
+                : (uint32_t)DRAIN_STASH_CAP + 1;
+            if (why == DRAIN_EXIT_LOW && seg >= 2 &&
+                count <= DRAIN_STASH_CAP) {
+                gate_drain_recoveries_++;
+                spi_client_io->drain_stash_len = seg;
+                spi_client_io->drain_stash_pos = 0;
+                *len = seg;
+                ret = ESP_OK;
+            } else {
+                if (captured > 0) {
+                    gate_drain_discards_++;
+                }
+                spi_client_io->drain_stash_len = 0;
+                spi_client_io->drain_stash_pos = 0;
+            }
+        }
         goto err;
     }
 
     /* Gate 2: wait-HIGH (Himax has staged the 2-byte count). */
     if (!spi_miso_wait_level_(1, 50, "AVAILABLE count HIGH")) {
         ESP_LOGW(TAG, "available: Himax never staged count (HIGH timeout)");
+        /* v0.4.50 (WI-2): transmitted but never answered at the transport
+         * layer — counts toward the streak. */
+        gate_note_failure_();
         ret = ESP_ERR_TIMEOUT;
         goto err;
     }
@@ -670,6 +1011,12 @@ static esp_err_t spi_txn_available_exec(sscma_client_io_spi_t *spi_client_io, si
     if (ret != ESP_OK) {
         goto err;
     }
+    /* v0.4.51 (D1): a dual-gate pass that clocks out the staged count
+     * is a completed transaction — reset the streak here, before the
+     * count decode. (Per the fix spec §0.1, the count is not a
+     * "frame"; the completion is the gate discipline plus the clocked
+     * response. This wire path is the link's heartbeat in idle.) */
+    gate_note_success_();
     *len = (spi_client_io->buffer[0] << 8) | spi_client_io->buffer[1];
     if (*len == 0xFFFF)
     {
@@ -818,7 +1165,10 @@ static esp_err_t spi_send_cmd_(sscma_client_io_spi_t *spi_client_io,
      * v0.4.18.38: Fatal now. Himax 0.4.20.38+ drives PB2. If timeout,
      * the Himax is down (rebooted/crashed); fail fast. */
     if (!spi_miso_wait_level_(0, 50, "RX-armed LOW")) {
-        ESP_LOGE(TAG, "spi_send_cmd: Himax not RX-armed (cmd=0x%02x), failing (Himax down?)", cmd);
+        /* v0.4.50 (WI-1/WI-2): the failure is counted and logged on the
+         * streak edge only. The per-attempt error line that used to live
+         * here was half of the wedge's ~24k-line log flood. */
+        gate_note_failure_();
         return ESP_ERR_TIMEOUT;
     }
     spi_transaction_t spi_trans = {};
@@ -865,6 +1215,12 @@ static esp_err_t spi_send_cmd_(sscma_client_io_spi_t *spi_client_io,
         trans_len -= chunk_size;
     }
     while (trans_len > 0);
+    /* v0.4.51 (D1): NO streak reset here. A bare gate pass plus a
+     * clocked header is not a transaction; completion — and with it
+     * the only streak resets — belongs to the exec functions above.
+     * The v0.4.50 reset at this site was the counterfeit one: it fired
+     * on send-episodes that went on to fail at the available exec,
+     * pinning the streak at the drain threshold for the whole flap. */
     return ESP_OK;
 }
 
@@ -975,18 +1331,13 @@ static esp_err_t sscma_client_spi_unpark(sscma_client_io_spi_t *spi_client_io)
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    /* Fallback: RESET resync (also no-gate). */
+    /* Fallback: RESET resync (also no-gate). v0.4.50: factored into
+     * spi_transport_resync_ so the link-health ladder's rung 2 shares
+     * this exact implementation (no-gate RESET, 50 ms settle, wait for
+     * the re-armed LOW up to 100 ms). */
     ESP_LOGW(TAG, "unpark: AVAILABLE failed, trying RESET resync");
-    ret = spi_send_cmd_no_gate_(spi_client_io,
-                                FEATURE_TRANSPORT_CMD_RESET, 0);
-    if (ret == ESP_OK) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        /* After RESET, the Himax re-arms normally (LOW). */
-        if (spi_miso_wait_level_(0, 100, "UNPARK RESET LOW")) {
-            return ESP_OK;
-        }
-    }
-    return ESP_FAIL;
+    return spi_transport_resync_(spi_client_io) == ESP_OK ? ESP_OK
+                                                           : ESP_FAIL;
 }
 
 /* v0.4.18.15: Common TX-DMA synchronization helper. After the S3 sends a
@@ -1022,14 +1373,21 @@ static bool spi_miso_wait_level_(int target_level, uint32_t timeout_ms, const ch
     while ((xTaskGetTickCount() - start) < timeout_ticks) {
         if (gpio_get_level(GPIO_NUM_6) == target_level) {
             bulk_stats_note_wait_(target_level, t0_us);
+            miso_wait_failing_ = false;
             return true;
         }
         /* Yield to avoid starving lower-priority tasks at prio 15. */
         vTaskDelay(1);
     }
     bulk_stats_note_wait_(target_level, t0_us);
-    ESP_LOGW("sscma_client.io.spi", "MISO-flag timeout waiting for %s (want %d)",
-             what, target_level);
+    /* v0.4.50 (WI-1): transition-only. This warning fired on every failed
+     * poll in the wedge (~1,157 lines/min); now it logs once per failure
+     * streak and stays silent until a wait succeeds again. */
+    if (!miso_wait_failing_) {
+        miso_wait_failing_ = true;
+        ESP_LOGW("sscma_client.io.spi", "MISO-flag timeout waiting for %s (want %d)",
+                 what, target_level);
+    }
     return false;
 }
 
@@ -1374,6 +1732,16 @@ void sscma_client_io_spi_test_end(sscma_client_io_handle_t io)
     }
 }
 
+/* v0.4.50 (WI-3): read the spitest hold (counter; >0 while a self-test
+ * owns the bus). */
+bool sscma_client_io_spi_test_active(sscma_client_io_handle_t io)
+{
+    if (!io) return false;
+    sscma_client_io_spi_t *spi_client_io =
+        __containerof(io, sscma_client_io_spi_t, base);
+    return spi_client_io->test_active > 0;
+}
+
 /* v0.4.14 (P1): bulk-read `size` bytes via CMD_START / CMD_READ_CRC /
  * CMD_STOP. Holds the io lock and the SPI bus for the whole transfer so
  * the AT poll task cannot interleave. On a chunk CRC mismatch the transfer
@@ -1528,6 +1896,11 @@ static esp_err_t spi_txn_bulk_exec(sscma_client_io_spi_t *spi_client_io, void *d
         {
             ESP_LOGI(TAG, "bulk read %u bytes ok (%d attempt(s))",
                      (unsigned)size, attempt + 1);
+            /* v0.4.51 (D1): a completed bulk transfer — kilobytes
+             * clocked under gate discipline with the per-segment
+             * CRC16 check passing — is the strongest completion
+             * evidence the link produces; reset the streak. */
+            gate_note_success_();
             ret = ESP_OK;
             break;
         }
@@ -1603,6 +1976,9 @@ static void spi_worker_task(void *arg)
                                             txn->params.bulk.buf,
                                             txn->params.bulk.len);
             break;
+        case SPI_TXN_RESYNC: /* v0.4.50: ladder rung 2 */
+            txn->result = spi_txn_resync_exec(spi_client_io);
+            break;
         default:
             ESP_LOGE(TAG, "SPI worker: unknown txn type %d", (int)txn->type);
             txn->result = ESP_ERR_INVALID_ARG;
@@ -1656,6 +2032,8 @@ static esp_err_t spi_submit_txn(sscma_client_io_spi_t *spi_client_io,
     case SPI_TXN_BULK:
         txn->params.bulk.buf = p1;
         txn->params.bulk.len = p2;
+        break;
+    case SPI_TXN_RESYNC: /* v0.4.50: no parameters */
         break;
     default:
         txn->in_use = false;
@@ -1717,4 +2095,15 @@ static esp_err_t client_io_spi_read_bulk(sscma_client_io_t *io, void *data, size
      * 1.26MB at ~30KB/s takes ~40s. AT txns queued behind bulk will hit
      * their 5s timeout and fail cleanly rather than interleaving. */
     return spi_submit_txn(spi_client_io, SPI_TXN_BULK, data, size, 120000);
+}
+
+/* v0.4.50 (WI-3): ladder rung 2 — queue the no-gate CMD_RESET resync on
+ * the SPI worker. The 2 s submit budget covers the worker queue wait
+ * plus the resync itself (50 ms settle + 100 ms re-arm wait). */
+esp_err_t sscma_client_io_spi_resync(sscma_client_io_handle_t io)
+{
+    if (!io) return ESP_ERR_INVALID_ARG;
+    sscma_client_io_spi_t *spi_client_io =
+        __containerof(io, sscma_client_io_spi_t, base);
+    return spi_submit_txn(spi_client_io, SPI_TXN_RESYNC, NULL, 0, 2000);
 }

@@ -127,6 +127,31 @@ static bool handshake_done_ = false;
 static int64_t link_up_at_ms_ = 0;
 static bool relink_inflight_ = false;
 #define RELINK_DEBOUNCE_MS 10000
+
+/* ------------------------------------------------------------------ */
+/* v0.4.50 link hardening (WI-2/WI-3): link generation, recovery        */
+/* accounting, and the link-health supervisor (ladder owner, below).   */
+/*                                                                      */
+/* link_gen_ increments every time Himax session state is lost and     */
+/* re-established (successful eyes_recover_camera, successful reboot   */
+/* re-link). Session-scoped Himax state (crop window, sample mode)     */
+/* does not survive a reset, so a state command that timed out across  */
+/* a generation change may have died with the old session; its caller  */
+/* may re-issue it exactly once (spec §2.5).                           */
+/* ------------------------------------------------------------------ */
+static volatile uint32_t link_gen_ = 0;
+static volatile bool link_recovery_in_progress_ = false;
+static uint32_t rec_reset_ = 0;   /* rung-2 (CMD_RESET) credited recoveries */
+static uint32_t rec_rst_ = 0;     /* rung-3 (RST) credited recoveries */
+static uint32_t rec_rail_ = 0;    /* rung-4 (rail) credited recoveries */
+static const char *last_rung_ = "none";
+static bool supervisor_started_ = false;
+static void eyes_link_health_task_(void *arg);
+
+uint32_t eyes_link_gen(void)
+{
+    return link_gen_;
+}
 #define RELINK_WORKER_STACK 4096
 static EventGroupHandle_t snap_events_;
 #define SNAP_GOT_IMAGE BIT0
@@ -355,6 +380,9 @@ static void relink_worker_(void *arg)
                  round + 1, RELINK_MAX_ROUNDS);
         if (eyes_rehandshake_("relink") == ESP_OK) {
             link_up_ = true;
+            /* v0.4.50: the Himax rebooted — session state was lost and
+             * re-established under a new generation. */
+            link_gen_++;
             link_up_at_ms_ = esp_timer_get_time() / 1000;
             ESP_LOGI(TAG, "re-link handshake complete");
             relink_inflight_ = false;
@@ -607,6 +635,19 @@ esp_err_t eyes_init(void)
     link_up_at_ms_ = esp_timer_get_time() / 1000;
 
     ESP_LOGI(TAG, "eyes ready");
+
+    /* v0.4.50: start the link-health supervisor (escalation-ladder
+     * owner). Internal-RAM stack like the re-link worker: it calls
+     * eyes_recover_camera, whose NVS-adjacent paths must not run from a
+     * PSRAM stack. */
+    if (!supervisor_started_) {
+        supervisor_started_ = true;
+        if (xTaskCreate(eyes_link_health_task_, "eyes_link_hlth", 4096,
+                        NULL, tskIDLE_PRIORITY + 3, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "link-health supervisor create failed");
+            supervisor_started_ = false;
+        }
+    }
     return ESP_OK;
 }
 
@@ -690,6 +731,8 @@ esp_err_t eyes_recover_camera(bool cycle_rail)
     ESP_LOGI(TAG, "camera recovered (rail_cycled=%d)", cycle_rail ? 1 : 0);
     /* v0.4.3: the Himax is answering again — the link is up. */
     link_up_ = true;
+    /* v0.4.50: session state was lost and re-established. */
+    link_gen_++;
     return ESP_OK;
 }
 
@@ -700,6 +743,392 @@ bool eyes_snap_busy(void)
     busy = snap_busy_;
     taskEXIT_CRITICAL(&snap_spin_);
     return busy;
+}
+
+/* ------------------------------------------------------------------ */
+/* v0.4.50 link-health supervisor: the escalation ladder (spec §2.3).  */
+/*                                                                     */
+/* Polls the io gate streak every 100 ms. An episode opens on the      */
+/* consecutive streak (>= 25) OR — v0.4.51 (G1) — on the io layer's    */
+/* trailing-60 s failure window (>= 60): the 2026-11-09 flap failed    */
+/* in bursts of 3 with a legitimate completion between bursts, a       */
+/* duty-cycle shape a consecutive-only trigger cannot see. Rung        */
+/* conditions read (streak OR failures-since-episode-open); the        */
+/* failure floor (1 s ≈ 3x margin over the Himax's own 300 ms Guard-2  */
+/* window — a healthy Himax in a Guard-2 wait clears long before       */
+/* rung 2 can fire) runs from episode open. The episode closes only    */
+/* after the streak has read 0 continuously for a 2 s health dwell     */
+/* (G1): a flapping link produces a failure sample at least every      */
+/* ~300 ms, so the dwell cannot complete mid-flap. Failed rungs >= 3   */
+/* back off exponentially (5 s -> 15 s -> 60 s cap) between attempts;  */
+/* v0.4.51 (owner amendment, fix-spec §18.5) adds a 5 s minimum        */
+/* spacing after ANY rung >= 3 attempt — the fail-only backoff let a   */
+/* procedurally successful but unhealing rung re-fire at procedure     */
+/* cadence. The rail rung is capped at 3 executions per rolling hour;  */
+/* past the cap the ladder latches to RST-only retries every 10 min    */
+/* until the link recovers. There is deliberately NO rung 5: the S3    */
+/* never reboots for a wedged peripheral. Recovery credit (G4) goes    */
+/* to a rung only if it fired inside this episode and the link         */
+/* generation has not moved since its success; a generation move no    */
+/* rung explains books as "external" (drain recoveries are counted     */
+/* by the io layer itself). One log line per rung attempt and outcome. */
+/* ------------------------------------------------------------------ */
+#define LINK_STREAK_RESET 25       /* rung 2: CMD_RESET resync */
+#define LINK_STREAK_RST 50         /* rungs 3/4 eligibility */
+#define LINK_FAIL_FLOOR_MS 1000    /* rungs >= 2 continuous-failure floor */
+#define GATE_RATE_THRESHOLD 60     /* v0.4.51 (G1): window60 episode trigger */
+#define LINK_HEALTH_DWELL_MS 2000  /* v0.4.51 (G1): episode close dwell */
+#define LINK_BACKOFF_1_MS 5000
+#define LINK_BACKOFF_2_MS 15000
+#define LINK_BACKOFF_CAP_MS 60000
+#define LINK_RAIL_CAP 3
+#define LINK_RAIL_WINDOW_MS (3600LL * 1000LL)
+#define LINK_LATCH_RETRY_MS (10LL * 60LL * 1000LL)
+#define LINK_RELAPSE_MS (10LL * 60LL * 1000LL)
+#define LINK_DEFER_SLICE_MS 500
+#define LINK_DEFER_MAX_MS 65000
+
+static bool link_bus_busy_(void)
+{
+    return eyes_snap_busy() || sscma_client_bulk_active(client_) ||
+           sscma_client_io_spi_test_active(io_);
+}
+
+/* v0.4.51 (G1): episode-health state. The supervisor task is the only
+ * writer of link_healthy_since_ms_; rungs >= 3 and the bus-wait below
+ * read the predicate. "Unhealthy" is defined on the STREAK — the 60 s
+ * window decays too slowly ever to hold an episode open: episode
+ * OPENING is disjunctive (streak or rate), episode health is
+ * streak-only. link_episode_active_ mirrors the supervisor's episode
+ * flag for the heartbeat's state string. Mirrors only: the supervisor
+ * loop keeps its own locals and may lag these by one 100 ms pass. */
+static volatile bool link_episode_active_ = false;
+static volatile int64_t link_healthy_since_ms_ = 0;
+
+static bool link_episode_unhealthy_(int64_t now_ms)
+{
+    return sscma_client_gate_streak() > 0 ||
+           (link_healthy_since_ms_ != 0 &&
+            (now_ms - link_healthy_since_ms_) < LINK_HEALTH_DWELL_MS);
+}
+
+/* Rungs >= 3 wait for the bus in 500 ms slices (bounded ~65 s) instead
+ * of barging in: interrupting a bulk capture or a self-test to RST the
+ * camera would create the very failures the ladder exists to heal.
+ * Returns false if episode health COMPLETED while waiting — the
+ * streak read 0 continuously through the full 2 s health dwell, so
+ * the episode is over and the caller must not run the rung (v0.4.51
+ * G1: previously it bailed on the first single streak-0 sample, which
+ * let a flapping link keep the ladder idle indefinitely) — or the
+ * bound expired busy. The health mirror is maintained by this wait
+ * too: it runs on the supervisor task, so a wait never lets the dwell
+ * bookkeeping stall. */
+static bool link_wait_bus_free_(void)
+{
+    int waited = 0;
+    while (link_bus_busy_()) {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (sscma_client_gate_streak() == 0) {
+            if (link_healthy_since_ms_ == 0) {
+                link_healthy_since_ms_ = now_ms;
+            }
+        } else {
+            link_healthy_since_ms_ = 0;
+        }
+        if (!link_episode_unhealthy_(now_ms)) {
+            return false; /* dwell completed: episode over */
+        }
+        if (waited >= LINK_DEFER_MAX_MS) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(LINK_DEFER_SLICE_MS));
+        waited += LINK_DEFER_SLICE_MS;
+    }
+    return link_episode_unhealthy_(esp_timer_get_time() / 1000);
+}
+
+static void eyes_link_health_task_(void *arg)
+{
+    (void)arg;
+    bool episode = false;
+    bool ep_reset_tried = false;
+    bool ep_rst_failed = false;
+    bool ep_rail_failed = false;
+    bool ep_relapse = false;        /* opened <10 min after an rst/rail close */
+    bool ep_cleared_link_up = false;
+    const char *ep_credit = "none"; /* last rung executed this episode */
+    int64_t ep_open_ms = 0;         /* v0.4.51 (G1): episode open time */
+    uint32_t ep_fail_base = 0;      /* v0.4.51 (G1): io total at open (FSEO base) */
+    uint32_t ep_open_gen = 0;       /* v0.4.51 (G4): link_gen_ at open */
+    uint32_t ep_credit_gen = 0;     /* v0.4.51 (G4): link_gen_ at credited rung success */
+    int rung_fail_streak = 0;       /* consecutive failed rungs >= 3 */
+    int64_t last_rung_try_ms = 0;
+    int64_t latch_next_try_ms = 0;
+    int64_t rail_times_ms[LINK_RAIL_CAP] = {0};
+    int rail_count = 0;
+    int64_t last_close_ms = 0;
+    const char *last_close_rung = "none";
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (!client_ || !io_) {
+            continue;
+        }
+        uint32_t streak = sscma_client_gate_streak();
+        uint32_t window = sscma_client_gate_failures_window();
+        uint32_t total = sscma_client_gate_failures_total();
+        int64_t now_ms = esp_timer_get_time() / 1000;
+
+        /* Prune the rolling rail window. */
+        {
+            int kept = 0;
+            for (int i = 0; i < rail_count; i++) {
+                if (now_ms - rail_times_ms[i] < LINK_RAIL_WINDOW_MS) {
+                    rail_times_ms[kept++] = rail_times_ms[i];
+                }
+            }
+            rail_count = kept;
+        }
+        bool rail_latched = rail_count >= LINK_RAIL_CAP;
+
+        /* v0.4.51 (G1): episode health tracking. The healthy mirror
+         * runs every pass, episode or not; the supervisor is its only
+         * writer (this loop and the rung bus-wait). */
+        if (streak == 0) {
+            if (link_healthy_since_ms_ == 0) {
+                link_healthy_since_ms_ = now_ms;
+            }
+        } else {
+            link_healthy_since_ms_ = 0;
+        }
+
+        if (episode &&
+            !link_episode_unhealthy_(now_ms)) {
+            /* Episode closed: the streak has read 0 continuously for
+             * the full 2 s health dwell. G4 crediting: the credited
+             * rung keeps its credit only if it fired inside this
+             * episode AND the link generation has not moved since its
+             * success snapshot; a generation that moved with no rung
+             * still holding credit means something outside the ladder
+             * recovered the link — booked "external". */
+            episode = false;
+            link_episode_active_ = false;
+            last_close_ms = now_ms;
+            const char *booked = "none";
+            if ((strcmp(ep_credit, "reset") == 0 ||
+                 strcmp(ep_credit, "rst") == 0 ||
+                 strcmp(ep_credit, "rail") == 0) &&
+                link_gen_ == ep_credit_gen) {
+                booked = ep_credit;
+            } else if (link_gen_ != ep_open_gen) {
+                booked = "external";
+            }
+            last_close_rung = booked;
+            if (strcmp(booked, "reset") == 0) {
+                rec_reset_++;
+            } else if (strcmp(booked, "rst") == 0) {
+                rec_rst_++;
+            } else if (strcmp(booked, "rail") == 0) {
+                rec_rail_++;
+            }
+            last_rung_ = booked;
+            if (ep_cleared_link_up) {
+                /* The AT layer is answering again (health dwell
+                 * completed): restore the honest up state cleared at
+                 * episode open. eyes_recover_camera already set it on
+                 * the rst/rail path; this also covers drain / reset /
+                 * self-healed closes. */
+                link_up_ = true;
+                ep_cleared_link_up = false;
+            }
+            ESP_LOGI(TAG, "himax link episode closed (rung=%s gen=%u)",
+                     booked, (unsigned)link_gen_);
+            continue;
+        }
+
+        if (!episode) {
+            if (streak < LINK_STREAK_RESET &&
+                window < GATE_RATE_THRESHOLD) {
+                continue; /* transient: rung 1 handles these in-io */
+            }
+            /* Open an episode (§3.2: link_up_ drops here, at the rung-2
+             * threshold — not on the first transient failure). v0.4.51
+             * (G1): the trigger is disjunctive — consecutive streak or
+             * the 60 s failure rate. (G4): every per-episode rung
+             * timestamp and generation snapshot re-bases HERE, so a
+             * stale backoff or a previous episode's generation can
+             * never leak into this one. */
+            episode = true;
+            link_episode_active_ = true;
+            ep_reset_tried = false;
+            ep_rst_failed = false;
+            ep_rail_failed = false;
+            ep_credit = "none";
+            rung_fail_streak = 0;
+            ep_open_ms = now_ms;
+            ep_fail_base = total;
+            last_rung_try_ms = 0;
+            ep_open_gen = link_gen_;
+            ep_credit_gen = 0;
+            link_healthy_since_ms_ = 0;
+            ep_relapse = (last_close_ms != 0 &&
+                          (now_ms - last_close_ms) < LINK_RELAPSE_MS &&
+                          (strcmp(last_close_rung, "rst") == 0 ||
+                           strcmp(last_close_rung, "rail") == 0));
+            ep_cleared_link_up = false;
+            if (link_up_) {
+                link_up_ = false;
+                ep_cleared_link_up = true;
+            }
+            ESP_LOGW(TAG, "himax link episode open: trigger=%s "
+                     "streak=%u window60=%u total=%u%s",
+                     streak >= LINK_STREAK_RESET ? "streak" : "rate",
+                     (unsigned)streak, (unsigned)window, (unsigned)total,
+                     ep_relapse ? " (fast relapse)" : "");
+        }
+
+        /* v0.4.51 (G1): failures since episode open — the rung-driving
+         * count alongside the streak. A flap's episode runs on FSEO
+         * long after its streak has been reset by inter-burst
+         * completions. */
+        uint32_t fseo = total - ep_fail_base;
+
+        /* Rung 2: CMD_RESET resync, once per episode. v0.4.51 (G1):
+         * the count condition is disjunctive (streak or FSEO) and the
+         * 1 s floor runs from EPISODE OPEN — under the old streak-age
+         * form a flap's floor could NEVER be met (the streak never
+         * lived 1 s), which is part of why the old ladder never fired. */
+        if (!ep_reset_tried &&
+            (streak >= LINK_STREAK_RESET || fseo >= LINK_STREAK_RESET) &&
+            (now_ms - ep_open_ms) >= LINK_FAIL_FLOOR_MS) {
+            ep_reset_tried = true;
+            link_recovery_in_progress_ = true;
+            ESP_LOGW(TAG, "himax ladder rung 2 (reset): streak=%u fseo=%u",
+                     (unsigned)streak, (unsigned)fseo);
+            esp_err_t r = sscma_client_io_spi_resync(io_);
+            link_recovery_in_progress_ = false;
+            if (r == ESP_OK) {
+                ep_credit = "reset";
+                /* G4: snapshot AFTER the call returns — a generation
+                 * the resync itself legitimately produced is inside
+                 * the snapshot, and any LATER move voids the credit. */
+                ep_credit_gen = link_gen_;
+                ESP_LOGW(TAG, "himax ladder rung 2 (reset): transport re-armed");
+            } else {
+                ESP_LOGW(TAG, "himax ladder rung 2 (reset): failed (%s)",
+                         esp_err_to_name(r));
+            }
+            continue;
+        }
+
+        if ((streak < LINK_STREAK_RST && fseo < LINK_STREAK_RST) ||
+            (now_ms - ep_open_ms) < LINK_FAIL_FLOOR_MS) {
+            continue;
+        }
+
+        /* Rungs 3/4. Rail is eligible only after a failed RST in this
+         * episode, after a failed rail attempt, or on fast relapse;
+         * never past the hourly cap. */
+        bool want_rail = (ep_rst_failed || ep_rail_failed || ep_relapse) &&
+                         !rail_latched;
+
+        /* Latch pacing (rail cap reached): RST-only, every 10 min. */
+        if (rail_latched && latch_next_try_ms != 0 &&
+            now_ms < latch_next_try_ms) {
+            continue;
+        }
+        /* Exponential backoff between failed rungs >= 3 — plus the
+         * v0.4.51 owner-amendment floor (fix-spec §18.5): a minimum
+         * LINK_BACKOFF_1_MS spacing after ANY rung >= 3 attempt. The
+         * backoff ladder alone counts only ESP_ERR outcomes, so a
+         * procedurally successful but unhealing rung re-fired at
+         * procedure cadence (≈ the recovery procedure's own ~2 s,
+         * forever). The floor applies to successes and failures
+         * alike; the fail ladder still dominates from the second
+         * consecutive failure on. */
+        int64_t backoff_ms = rung_fail_streak == 0 ? 0 :
+                             rung_fail_streak == 1 ? LINK_BACKOFF_1_MS :
+                             rung_fail_streak == 2 ? LINK_BACKOFF_2_MS :
+                                                     LINK_BACKOFF_CAP_MS;
+        int64_t min_gap_ms = backoff_ms < LINK_BACKOFF_1_MS
+                             ? LINK_BACKOFF_1_MS : backoff_ms;
+        if (last_rung_try_ms != 0 &&
+            (now_ms - last_rung_try_ms) < min_gap_ms) {
+            continue;
+        }
+
+        if (!link_wait_bus_free_()) {
+            continue; /* health dwell completed, or bus stayed busy */
+        }
+        if (!link_episode_unhealthy_(esp_timer_get_time() / 1000)) {
+            continue; /* episode ended during the wait; booked next pass */
+        }
+
+        last_rung_try_ms = esp_timer_get_time() / 1000;
+        link_recovery_in_progress_ = true;
+        if (want_rail) {
+            /* Count the execution against the hourly cap regardless of
+             * outcome: the rail physically cycles either way. */
+            if (rail_count < LINK_RAIL_CAP) {
+                rail_times_ms[rail_count++] = last_rung_try_ms;
+            }
+            ESP_LOGW(TAG, "himax ladder rung 4 (rail): streak=%u rail_used=%d/%d",
+                     (unsigned)sscma_client_gate_streak(),
+                     rail_count, LINK_RAIL_CAP);
+            esp_err_t r = eyes_recover_camera(true);
+            link_recovery_in_progress_ = false;
+            if (r == ESP_OK) {
+                ep_credit = "rail";
+                ep_credit_gen = link_gen_; /* G4: snapshot after the call */
+                ESP_LOGW(TAG, "himax ladder rung 4 (rail): recovered");
+            } else {
+                ep_rail_failed = true;
+                rung_fail_streak++;
+                ESP_LOGW(TAG, "himax ladder rung 4 (rail): failed (%s)",
+                         esp_err_to_name(r));
+            }
+        } else {
+            if (rail_latched) {
+                latch_next_try_ms = last_rung_try_ms + LINK_LATCH_RETRY_MS;
+            }
+            ESP_LOGW(TAG, "himax ladder rung 3 (rst): streak=%u%s",
+                     (unsigned)sscma_client_gate_streak(),
+                     rail_latched ? " (rail latched, cap reached)" : "");
+            esp_err_t r = eyes_recover_camera(false);
+            link_recovery_in_progress_ = false;
+            if (r == ESP_OK) {
+                ep_credit = "rst";
+                ep_credit_gen = link_gen_; /* G4: snapshot after the call */
+                ESP_LOGW(TAG, "himax ladder rung 3 (rst): recovered");
+            } else {
+                ep_rst_failed = true;
+                rung_fail_streak++;
+                ESP_LOGW(TAG, "himax ladder rung 3 (rst): failed (%s)",
+                         esp_err_to_name(r));
+            }
+        }
+    }
+}
+
+void eyes_himax_link_info(eyes_himax_link_info_t *out)
+{
+    if (!out) {
+        return;
+    }
+    uint32_t streak = sscma_client_gate_streak();
+    out->streak = streak;
+    out->gen = link_gen_;
+    out->rec_drain = sscma_client_gate_drain_recoveries();
+    out->rec_reset = rec_reset_;
+    out->rec_rst = rec_rst_;
+    out->rec_rail = rec_rail_;
+    out->last_rung = last_rung_;
+    /* v0.4.51 (G1 rider): while an episode is open the state reads
+     * "down" even between failure bursts, when the streak
+     * momentarily reads 0 — the flap's heartbeat never did. */
+    out->state = link_recovery_in_progress_ ? "recovering"
+                 : (link_episode_active_ ? "down"
+                    : (streak == 0 ? "up" : "down"));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1554,7 +1983,20 @@ esp_err_t eyes_capture_strips(uint16_t overlap_rows)
         ESP_LOGI(TAG, "capture_strips: strip %u/%u y0=%u h=%u",
                  (unsigned)i, (unsigned)n, (unsigned)y0, (unsigned)h);
 
-        err = eyes_set_crop(0, (uint16_t)y0, STRIP_W, (uint16_t)h);
+        /* v0.4.50 (§2.5): if the crop set timed out across a link
+         * generation change, the command may have died with the old
+         * Himax session — re-issue it exactly once against the new
+         * session. Any other failure (or a second timeout) is final. */
+        {
+            uint32_t gen0 = eyes_link_gen();
+            err = eyes_set_crop(0, (uint16_t)y0, STRIP_W, (uint16_t)h);
+            if (err == ESP_ERR_TIMEOUT && eyes_link_gen() != gen0) {
+                ESP_LOGW(TAG, "capture_strips: crop set lost with Himax "
+                              "session (gen %u->%u); re-issuing once",
+                         (unsigned)gen0, (unsigned)eyes_link_gen());
+                err = eyes_set_crop(0, (uint16_t)y0, STRIP_W, (uint16_t)h);
+            }
+        }
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "capture_strips: CROP failed for strip %u", (unsigned)i);
             break;
@@ -1937,37 +2379,8 @@ static const char *snap_grab_frame_png_(int id, const char *mid,
     return NULL; /* success */
 }
 
-/* v0.4.49.1 diagnostic: exercise the esp_timer insert/remove path at
- * known points inside a capture. The 0.4.49 StoreProhibited panics died
- * in esp_timer's timer_insert walking a timer list corrupted by a stray
- * write; if the list is already poisoned at a probe point, the fault
- * lands HERE, attributable to the stage that ran before it, instead of
- * in an unrelated timer callback. Also logs this task's stack
- * high-water mark and the free internal heap at each point. */
-static void timer_probe_cb_(void *arg) { (void)arg; }
-
-static void timer_list_probe_(const char *where)
-{
-    esp_timer_handle_t probe = NULL;
-    const esp_timer_create_args_t pargs = {
-        .callback = timer_probe_cb_,
-        .name = "png_probe",
-    };
-    if (esp_timer_create(&pargs, &probe) == ESP_OK && probe) {
-        esp_timer_start_once(probe, 3600ULL * 1000000ULL);
-        esp_timer_stop(probe);
-        esp_timer_delete(probe);
-    }
-    ESP_LOGI(TAG, "timer probe ok @%s: stack_hwm=%u int_free=%u int_largest=%u",
-             where,
-             (unsigned)uxTaskGetStackHighWaterMark(NULL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-}
-
 esp_err_t eyes_capture_png(void)
 {
-    timer_list_probe_("capture_png entry");
     /* v0.4.18.4: LED "say cheese" countdown, mirroring the snapshot path.
      * Three white blinks over ~600ms, LED off during capture, then green
      * on success / red on failure. Starts BEFORE the link check so the
@@ -2036,7 +2449,6 @@ esp_err_t eyes_capture_png(void)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    timer_list_probe_("capture_png post-bulk");
     /* v0.4.18.79: Stream the PNG directly via png_chunk_cb_ instead of
      * buffering the entire image in a fixed 2MB PNG_OUT_CAP buffer.
      * The fixed buffer caused "sink full" ESP_FAIL on less-compressible
@@ -2072,7 +2484,6 @@ esp_err_t eyes_capture_png(void)
     png_crash_detector_arm(2);
     err = png_stream_encode(raw, &cfg, png_dbg_streaming_sink_cb, sctx, &res);
     png_crash_detector_disarm();
-    timer_list_probe_("capture_png post-encode");
     ESP_LOGI(TAG, "PNG encode done: err=%d, bytes=%u, chunks=%d",
              err, (unsigned)sctx->total_bytes, sctx->seq);
     if (!raw_is_aob) heap_caps_free(raw);

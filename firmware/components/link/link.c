@@ -894,6 +894,36 @@ static void link_heartbeat_task(void *arg)
             cJSON_AddNumberToObject(o, "uptime_s",
                 (double)(esp_timer_get_time() / 1000000));
             cJSON_AddStringToObject(o, "fw", fw_version_);
+            /* v0.4.50 (WI-1): nested Himax link-health object. state is
+             * "up" (answering), "down" (gate failing) or "recovering"
+             * (a ladder rung in progress); streak is the io gate-failure
+             * streak; gen the Himax session generation; rec_* are the
+             * per-rung recovery counters since boot; last_rung the rung
+             * credited with the most recent recovery.
+             * v0.4.51 (D3): emitted IMMEDIATELY after "fw" on purpose.
+             * The bridge truncates long telemetry lines at ~290 chars;
+             * at its old position (after stack_hwm) this object ended
+             * near char 370 and was truncated out of every heartbeat
+             * in the 6-hour flap log — the audit found it had literally
+             * never been observed. Here the object ends at ~char 194 of
+             * the serialized heartbeat, inside the truncation budget
+             * with ~96 chars to spare. Do not move it back down. */
+            {
+                eyes_himax_link_info_t li;
+                eyes_himax_link_info(&li);
+                cJSON *hl = cJSON_CreateObject();
+                if (hl) {
+                    cJSON_AddStringToObject(hl, "state", li.state);
+                    cJSON_AddNumberToObject(hl, "streak", (double)li.streak);
+                    cJSON_AddNumberToObject(hl, "gen", (double)li.gen);
+                    cJSON_AddNumberToObject(hl, "rec_drain", (double)li.rec_drain);
+                    cJSON_AddNumberToObject(hl, "rec_reset", (double)li.rec_reset);
+                    cJSON_AddNumberToObject(hl, "rec_rst", (double)li.rec_rst);
+                    cJSON_AddNumberToObject(hl, "rec_rail", (double)li.rec_rail);
+                    cJSON_AddStringToObject(hl, "last_rung", li.last_rung);
+                    cJSON_AddItemToObject(o, "himax_link", hl);
+                }
+            }
             cJSON_AddNumberToObject(o, "baud", (double)link_baud_);
             /* v0.4.28: achieved baud from the live CLKDIV + RX FIFO
              * overflow count — the UART path's vital signs. */
@@ -935,6 +965,8 @@ static void link_heartbeat_task(void *arg)
                     "snap", "snaptest",
                     /* v0.4.18.70 (Claude F6g): Track console_tx HWM. */
                     "console_tx",
+                    /* v0.4.50: link-health supervisor (ladder owner). */
+                    "eyes_link_hlth",
                 };
                 cJSON *hwm = cJSON_CreateObject();
                 for (size_t i = 0;
@@ -1255,6 +1287,24 @@ static void handle_command(cJSON *cmd)
         }
         cJSON_Delete(id);
         link_pending_term(cmd_mid_);
+        /* v0.4.50 (§3.3): force-tag the origin on the inner command, so
+         * the recursion sees the same origin facts as the native-MQTT
+         * path (link_sealed_dispatch). Before this fix the recursion
+         * carried NEITHER tag, and the gates below key on _via_mqtt —
+         * so serial-only commands refused on the native path executed
+         * when the identical sealed command arrived bridged (the
+         * sealed_fwd handler dispatches from above the gates).
+         * _sealed is set only when the envelope cryptographically
+         * verified against the pinned commander key (rc == WMS2_OK);
+         * a grace-accepted envelope (WMS2_OK_GRACE, unauthenticated)
+         * gets _via_mqtt but NOT _sealed. Both tags are forced,
+         * replacing any host-supplied values. */
+        cJSON_DeleteItemFromObject(inner, "_via_mqtt");
+        cJSON_AddTrueToObject(inner, "_via_mqtt");
+        cJSON_DeleteItemFromObject(inner, "_sealed");
+        if (rc == WMS2_OK) {
+            cJSON_AddTrueToObject(inner, "_sealed");
+        }
         handle_command(inner); /* recursion: inner handler sends the reply */
         cJSON_Delete(inner);
         return;
@@ -2002,12 +2052,33 @@ static void handle_command(cJSON *cmd)
             const char *args = opt_str(cmd, "args");
             if (args && *args) {
                 if (strcmp(args, "clear") == 0) {
+                    /* v0.4.50 (§2.5): re-issue once if the command timed
+                     * out across a link generation change (it may have
+                     * died with the old Himax session). */
+                    uint32_t gen0 = eyes_link_gen();
                     err = eyes_clear_crop();
+                    if (err == ESP_ERR_TIMEOUT && eyes_link_gen() != gen0) {
+                        ESP_LOGW(TAG, "dbg crop clear lost with Himax "
+                                      "session (gen %u->%u); re-issuing once",
+                                 (unsigned)gen0, (unsigned)eyes_link_gen());
+                        err = eyes_clear_crop();
+                    }
                 } else {
                     unsigned x = 0, y = 0, w = 0, h = 0;
                     if (sscanf(args, "%u,%u,%u,%u", &x, &y, &w, &h) == 4) {
+                        /* v0.4.50 (§2.5): same one-shot re-issue as the
+                         * clear branch — AT+CROP is idempotent. */
+                        uint32_t gen0 = eyes_link_gen();
                         err = eyes_set_crop((uint16_t)x, (uint16_t)y,
                                             (uint16_t)w, (uint16_t)h);
+                        if (err == ESP_ERR_TIMEOUT &&
+                            eyes_link_gen() != gen0) {
+                            ESP_LOGW(TAG, "dbg crop set lost with Himax "
+                                          "session (gen %u->%u); re-issuing once",
+                                     (unsigned)gen0, (unsigned)eyes_link_gen());
+                            err = eyes_set_crop((uint16_t)x, (uint16_t)y,
+                                                (uint16_t)w, (uint16_t)h);
+                        }
                     } else {
                         err = ESP_ERR_INVALID_ARG;
                     }
@@ -2252,19 +2323,60 @@ static void handle_command(cJSON *cmd)
         if (strcmp(sub, "eyes_reset") == 0) {
             /* v0.4.3: moved from top-level {"t":"eyes_reset"} for
              * consistency with dbg/reboot. Himax rail power-cycle + RST
-             * + re-handshake. Serial console only: this yanks the camera
-             * power rail, which a remote caller must never do
-             * unattended. {"t":"dbg","cmd":"eyes_reset"} or
-             * {"t":"dbg","cmd":"eyes_reset","rail":0} (warm-only). */
-            if (via_mqtt) {
-                link_respond_err(t, "serial console only");
+             * + re-handshake. (v0.4.50: no longer serial-only — the
+             * origin policy below governs remote callers.)
+             * {"t":"dbg","cmd":"eyes_reset"} or
+             * {"t":"dbg","cmd":"eyes_reset","rail":0} (warm-only).
+             * v0.4.50 (§3.3): the blanket remote refusal is replaced by
+             * an origin policy. Serial callers: unchanged (rail
+             * defaults to 1). Remote callers (_via_mqtt): allowed ONLY
+             * with _sealed set — the command's envelope cryptographically
+             * verified against the pinned commander key. (The spec's
+             * "highest seal scope" is realized as _sealed: the shipped
+             * WMS2 verify path has a single pinned commander key and no
+             * per-key scope tiers — reduced-scope keys are a deferred
+             * design; if tiers land, the tier test goes here.) For
+             * remote callers the rail default flips to 0 (warm RST
+             * recovery); a remote rail cycle requires an explicit
+             * "rail":1 in the same sealed command. Rationale: the
+             * link-health supervisor already performs unattended
+             * RST/rail recovery on this device, so a sealed remote
+             * reset adds no new unattended capability — while an
+             * unsealed one would let anyone able to publish to the
+             * broker yank the camera. */
+            bool sealed = cJSON_IsTrue(cJSON_GetObjectItem(cmd, "_sealed"));
+            if (via_mqtt && !sealed) {
+                link_respond_err(t, "eyes_reset over MQTT requires a sealed command");
                 return;
             }
             if (eyes_snap_busy()) {
                 link_respond_err(t, "snapshot in progress");
                 return;
             }
-            bool rail = opt_int(cmd, "rail", 1) != 0;
+            /* v0.4.51 (G3): rail is 1 ONLY for the JSON number 1
+             * (valuedouble == 1.0). The old opt_int parse silently
+             * mapped a JSON true to the origin default — 1 on serial:
+             * a warm-reset typo became a rail cycle. Absent key keeps
+             * the origin defaults (serial 1 / remote 0); every other
+             * value or type (true, 2, "1", 1.5) parses to 0, warm
+             * only, and the line below records what was parsed, from
+             * which origin, and the key's actual type — the exact
+             * ambiguity the audit flagged, now visible in the log. */
+            cJSON *rail_item = cJSON_GetObjectItem(cmd, "rail");
+            const char *rail_kind = "absent";
+            bool rail;
+            if (!rail_item) {
+                rail = !via_mqtt;
+            } else if (cJSON_IsNumber(rail_item)) {
+                rail_kind = "number";
+                rail = (rail_item->valuedouble == 1.0);
+            } else {
+                rail_kind = "other";
+                rail = false;
+            }
+            ESP_LOGI(TAG, "eyes_reset: rail=%d origin=%s key=%s",
+                     rail ? 1 : 0, via_mqtt ? "mqtt" : "serial",
+                     rail_kind);
             esp_err_t rerr = eyes_recover_camera(rail);
             if (rerr == ESP_OK) {
                 link_respond_ok(t);
@@ -2478,8 +2590,11 @@ static void handle_command(cJSON *cmd)
  * native-MQTT commands (see mqtt_native.c). The command is tagged
  * _via_mqtt — forced on, replacing any host-supplied value, so a
  * sealed command can never claim serial origin and serial-only
- * provisioning commands are refused for it. */
-void link_sealed_dispatch(const char *json, size_t len)
+ * provisioning commands are refused for it. v0.4.50: the command is
+ * also tagged _sealed when `verified` (body cryptographically verified
+ * by seal_dev); grace-mode plain commands (verified=false) never get
+ * it, and any host-supplied _sealed is stripped. */
+void link_sealed_dispatch(const char *json, size_t len, bool verified)
 {
     if (!json || len == 0 || !cmd_queue_) {
         return;
@@ -2506,6 +2621,14 @@ void link_sealed_dispatch(const char *json, size_t len)
     }
     cJSON_DeleteItemFromObject(cmd, "_via_mqtt");
     cJSON_AddTrueToObject(cmd, "_via_mqtt");
+    /* v0.4.50: _sealed marks a body seal_dev cryptographically verified
+     * against the pinned commander key (verified=true from
+     * mqtt_native). Grace-mode plain commands arrive verified=false and
+     * never carry it; any host-supplied claim is deleted first. */
+    cJSON_DeleteItemFromObject(cmd, "_sealed");
+    if (verified) {
+        cJSON_AddTrueToObject(cmd, "_sealed");
+    }
     if (xQueueSend(cmd_queue_, &cmd, 0) != pdPASS) {
         ESP_LOGW(TAG, "sealed_dispatch: worker busy, dropped '%s'", t);
         link_respond_err_mid(t, "busy", opt_str(cmd, "_mid"));

@@ -97,6 +97,11 @@ esp_err_t sscma_client_reset(sscma_client_handle_t client);
  *          - ESP_OK on success
  */
 esp_err_t sscma_client_flush_rx(sscma_client_handle_t client);
+
+/* v0.4.50 (link hardening WI-3): true while a bulk transfer owns the
+ * SPI bus. The eyes link-health supervisor defers recovery rungs while
+ * this is set (the bulk executor runs its own escalation). */
+bool sscma_client_bulk_active(sscma_client_handle_t client);
 /**
  * @brief Read data from SCCMA client
  *

@@ -94,11 +94,15 @@ void link_ai_thinking_stop(void);
 bool link_pending_done(const char *mid);
 
 /** Parse a JSON command line and enqueue it on the worker path, exactly
- *  as if it arrived over the USB-serial console. Used for verified
- *  native-MQTT commands. The command is tagged _via_mqtt (serial-only
- *  provisioning commands are refused for such commands). Thread-safe;
+ *  as if it arrived over the USB-serial console. Used for native-MQTT
+ *  commands. The command is tagged _via_mqtt (serial-only
+ *  provisioning commands are refused for such commands), and — v0.4.50 —
+ *  tagged _sealed when `verified` is true, i.e. the body came out of an
+ *  envelope seal_dev cryptographically verified against the pinned
+ *  commander key (false for grace-mode plain commands). Both tags are
+ *  forced, replacing any host-supplied values. Thread-safe;
  *  drops with a correlated "busy" reply when the worker queue is full. */
-void link_sealed_dispatch(const char *json, size_t len);
+void link_sealed_dispatch(const char *json, size_t len, bool verified);
 
 /** Register a callback invoked with the TX lock held for every serial
  *  TX line, before the line buffer is freed. The callback must be

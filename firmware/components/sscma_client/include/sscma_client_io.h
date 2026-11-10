@@ -179,6 +179,51 @@ esp_err_t sscma_client_io_spi_test_pattern(sscma_client_io_handle_t io,
 void sscma_client_io_spi_test_begin(sscma_client_io_handle_t io);
 void sscma_client_io_spi_test_end(sscma_client_io_handle_t io);
 
+/* v0.4.50 (link hardening WI-3): read the spitest hold flag. The eyes
+ * link-health supervisor checks it before running a recovery rung —
+ * recovery defers while a self-test owns the bus. */
+bool sscma_client_io_spi_test_active(sscma_client_io_handle_t io);
+
+/* v0.4.50 (link hardening WI-3): queue a no-gate CMD_RESET resync on the
+ * SPI worker (ladder rung 2). Serialized against AT and bulk traffic by
+ * the worker queue. ESP_OK if the Himax re-armed (MISO LOW) after the
+ * reset, ESP_ERR_TIMEOUT otherwise. */
+esp_err_t sscma_client_io_spi_resync(sscma_client_io_handle_t io);
+
+/* v0.4.50 (link hardening WI-2): the consecutive transport gate-failure
+ * streak, owned by the SPI io layer. Counts consecutive worker
+ * transactions that failed at a gate (never transmitted, or transmitted
+ * but never answered at the transport layer); an AT-layer error reply
+ * is a completed transaction. Implemented by the SPI transport; the
+ * accessors exist so ops.c (poll summary) and eyes.c (link-health
+ * supervisor, heartbeat) can read the same counter the io layer
+ * maintains.
+ * v0.4.51 (D1): the streak resets ONLY at exec-level completions —
+ * the write-exec ESP_OK epilogue, the read-exec ESP_OK exits, the
+ * available exec's wire path after the count clock-out, and the
+ * bulk-exec success point. There is deliberately no exported reset:
+ * the reset sites must stay enumerable (exactly four
+ * gate_note_success_ call sites in the io source). */
+uint32_t sscma_client_gate_streak(void);
+/* Milliseconds since the current streak began (0 when the streak is 0). */
+int64_t sscma_client_gate_streak_age_ms(void);
+/* v0.4.51 (G1): gate failures in the trailing 60 s (slotted window,
+ * 6 slots x 10 s, maintained in the io layer's failure funnel) and the
+ * monotonic since-boot failure total. The window is the ladder's rate
+ * trigger — it sees duty-cycle faults (the 2026-11-09 flap) that a
+ * consecutive-only streak structurally cannot. */
+uint32_t sscma_client_gate_failures_window(void);
+uint32_t sscma_client_gate_failures_total(void);
+/* Declared rung-1 drain recoveries since boot. v0.4.51 (D2): a
+ * recovery is declared only on a gate-LOW drain exit whose captured
+ * segment survives validation (non-padding after the trailing idle
+ * run is stripped; decoded count fits the drain stash). */
+uint32_t sscma_client_gate_drain_recoveries(void);
+/* Drain captures discarded by the D2 validation since boot. Counted,
+ * never logged per-discard (drains fire at flap cadence); surfaced
+ * via the ops poll summary. */
+uint32_t sscma_client_gate_drain_discards(void);
+
 #ifdef __cplusplus
 }
 #endif
