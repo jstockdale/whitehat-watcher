@@ -13,6 +13,9 @@ HASH_HEADER="$SCRIPT_DIR/library/sscma_micro/sscma/server/at/callback/watcher_bu
 KEY_SOURCES=(
     "$SCRIPT_DIR/library/sscma_micro_porting/porting/himax/we2/ma_transport_spi.cpp"
     "$SCRIPT_DIR/library/sscma_micro_porting/porting/himax/we2/ma_transport_spi.h"
+    # v0.4.20.61: the camera file carries behavior-defining code too (crop
+    # buffer management) — a change there must move the fingerprint.
+    "$SCRIPT_DIR/library/sscma_micro_porting/porting/himax/we2/ma_camera_himax.cpp"
 )
 
 # Verify all key sources exist

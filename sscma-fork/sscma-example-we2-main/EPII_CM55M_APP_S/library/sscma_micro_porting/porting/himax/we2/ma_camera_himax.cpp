@@ -435,30 +435,54 @@ ma_err_t CameraHimax::setCropWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t
     /* 32-byte align the size (DCache line) and the base address (DMA),
      * same as the raw preset path in init(). */
     need = (need + 31) & ~31u;
-    MA_LOGD(MA_TAG, "Crop: allocating %lu bytes for %ux%u window", (unsigned long)need, w, h);
-    _raw_capture_alloc = new (std::nothrow) uint8_t[need + 32];
-    if (_raw_capture_alloc == nullptr) {
-        MA_LOGE(MA_TAG, "Crop: buffer allocation failed (%lu bytes)", (unsigned long)need);
-        return MA_ENOMEM;
+
+    /* The raw capture buffer is persistent by design (see deInit): it is
+     * allocated once and kept across raw modes because the heap only has
+     * room for ONE 1.26MB buffer. This code originally allocated a second
+     * buffer here and failed with MA_ENOMEM whenever a raw preset had
+     * been initialized first — i.e. in every real capture sequence. Reuse
+     * the persistent buffer whenever it is large enough, the same guard
+     * init() uses; allocate only when there is none or it is too small. */
+    bool fresh_alloc = false;
+    if (_raw_capture_alloc == nullptr || _raw_capture_buf_size < need) {
+        if (_raw_capture_alloc != nullptr) {
+            drv_ov5647_clear_raw_buffer();
+            delete[] _raw_capture_alloc;
+            _raw_capture_alloc    = nullptr;
+            _raw_capture_buf      = nullptr;
+            _raw_capture_buf_size = 0;
+        }
+        MA_LOGD(MA_TAG, "Crop: allocating %lu bytes for %ux%u window", (unsigned long)need, w, h);
+        _raw_capture_alloc = new (std::nothrow) uint8_t[need + 32];
+        if (_raw_capture_alloc == nullptr) {
+            MA_LOGE(MA_TAG, "Crop: buffer allocation failed (%lu bytes)", (unsigned long)need);
+            return MA_ENOMEM;
+        }
+        fresh_alloc       = true;
+        uintptr_t aligned = ((uintptr_t)_raw_capture_alloc + 31u) & ~(uintptr_t)31u;
+        _raw_capture_buf  = (uint8_t*)aligned;
+        if (((uintptr_t)_raw_capture_buf & 31u) != 0) {
+            MA_LOGE(MA_TAG, "Crop: alignment failure");
+            delete[] _raw_capture_alloc;
+            _raw_capture_alloc = nullptr;
+            _raw_capture_buf   = nullptr;
+            return MA_EINVAL;
+        }
+        _raw_capture_buf_size = need;
+    } else {
+        MA_LOGD(MA_TAG, "Crop: reusing persistent raw buffer (%lu bytes) for %ux%u window",
+                (unsigned long)_raw_capture_buf_size, w, h);
     }
-    uintptr_t aligned = ((uintptr_t)_raw_capture_alloc + 31u) & ~(uintptr_t)31u;
-    _raw_capture_buf  = (uint8_t*)aligned;
-    if (((uintptr_t)_raw_capture_buf & 31u) != 0) {
-        MA_LOGE(MA_TAG, "Crop: alignment failure");
-        delete[] _raw_capture_alloc;
-        _raw_capture_alloc = nullptr;
-        _raw_capture_buf   = nullptr;
-        return MA_EINVAL;
-    }
-    _raw_capture_buf_size = need;
     drv_ov5647_set_raw_buffer(_raw_capture_buf, need, 8);
 
     ma_err_t ec = drv_ov5647_init_raw_fullres(x, y, w, h, 8);
     if (ec != MA_OK) {
-        delete[] _raw_capture_alloc;
-        _raw_capture_alloc    = nullptr;
-        _raw_capture_buf      = nullptr;
-        _raw_capture_buf_size = 0;
+        if (fresh_alloc) {
+            delete[] _raw_capture_alloc;
+            _raw_capture_alloc    = nullptr;
+            _raw_capture_buf      = nullptr;
+            _raw_capture_buf_size = 0;
+        }
         drv_ov5647_clear_raw_buffer();
         return ec;
     }
